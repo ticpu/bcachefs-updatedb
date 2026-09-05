@@ -10,6 +10,9 @@ authors = ["Jérôme Poulin <jeromepoulin@gmail.com>"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+rand = "0.9"
+tempfile = "3"
+zstd = "0.14"
 
 [profile.release]
 opt-level = 3

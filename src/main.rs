@@ -1,12 +1,18 @@
 //! Build a filename list from a mounted bcachefs by streaming the dirents btree
 //! through BCH_IOCTL_QUERY_BTREE_KEYS, instead of walking it with readdir.
 
+use bcachefs_updatedb::plocate_db::{
+    self, DatabaseBuilder, Header, TRIGRAM_SIZE, Trigram, ZSTD_LEVEL,
+};
 use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::time::Instant;
+use zstd::dict::EncoderDictionary;
 
 const BTREE_DIRENTS: u32 = 2;
 const BTREE_SUBVOLUMES: u32 = 8;
@@ -439,6 +445,37 @@ enum Cmd {
         #[arg(long)]
         dump_dirs: bool,
     },
+    /// Write a plocate database from the live namespace.
+    Build {
+        /// Mount point of the bcachefs filesystem.
+        mount: String,
+        /// Database to write, replaced atomically.
+        #[arg(long, value_name = "DB")]
+        output: String,
+        /// Path the indexed names are rooted at (default: the mount point).
+        #[arg(long, value_name = "PATH")]
+        prefix: Option<String>,
+        /// Exact path to exclude, repeatable.
+        #[arg(long, value_name = "PATH")]
+        prune: Vec<String>,
+        /// Group owning the database (default: the group of the setgid plocate on PATH).
+        #[arg(long, value_name = "NAME")]
+        group: Option<String>,
+        /// Have plocate check visibility before reporting a file.
+        #[arg(long, value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set, value_parser = parse_bool)]
+        require_visibility: bool,
+        /// Number of filenames per compressed block.
+        #[arg(long, value_name = "N", default_value_t = 32)]
+        block_size: usize,
+    },
+    /// Print the header of a plocate database, and optionally its posting lists.
+    Dbinfo {
+        /// Database to read.
+        db: String,
+        /// Print one line per non-empty hash table slot instead of the header.
+        #[arg(long)]
+        posting_lists: bool,
+    },
     /// Count dirent keys and name bytes by type.
     Stats {
         /// Mount point of the bcachefs filesystem.
@@ -456,18 +493,29 @@ enum Cmd {
     },
 }
 
-impl Cmd {
-    fn mount(&self) -> &str {
-        match self {
-            Cmd::Paths { mount, .. }
-            | Cmd::Stats { mount }
-            | Cmd::Dump { mount }
-            | Cmd::Subvols { mount } => mount,
-        }
+fn parse_bool(s: &str) -> Result<bool, String> {
+    match s {
+        "0" | "no" | "false" => Ok(false),
+        "1" | "yes" | "true" => Ok(true),
+        _ => Err(format!("expected one of 0, 1, no, yes, false, true: {s}")),
     }
 }
 
-fn cmd_paths(fd: i32, prefix: &str, prunes: &[String], dump_dirs: bool) -> io::Result<()> {
+fn open_mount(mount: &str) -> io::Result<File> {
+    let fs = open_fs(mount)?;
+    check_bcachefs(fs.as_raw_fd(), mount)?;
+    Ok(fs)
+}
+
+/// The live namespace: every directory inode with the paths it is reachable
+/// under, and the ancestry set of each subvolume context.
+struct Namespace {
+    subvols: HashMap<u32, Subvol>,
+    resolved: HashMap<u64, Vec<(u32, u32, String)>>,
+    vis_cache: HashMap<u32, HashMap<u32, u32>>,
+}
+
+fn resolve_namespace(fd: i32, prefix: &str, prunes: &[String]) -> io::Result<Namespace> {
     let subvols = read_subvols(fd)?;
     let snaps = read_snapshots(fd)?;
     eprintln!("{} subvolumes, {} snapshots", subvols.len(), snaps.len());
@@ -603,31 +651,39 @@ fn cmd_paths(fd: i32, prefix: &str, prunes: &[String], dump_dirs: bool) -> io::R
     }
     eprintln!("resolved {} directory paths", resolved.len());
 
-    if dump_dirs {
-        let stdout = io::stdout();
-        let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
-        for (inode, ctxs) in &resolved {
-            for (subvol, ctx, path) in ctxs {
-                writeln!(out, "{inode}\t{subvol}\t{ctx}\t{path}")?;
-            }
-        }
-        return out.flush();
-    }
+    Ok(Namespace {
+        subvols,
+        resolved,
+        vis_cache,
+    })
+}
 
-    // Emit every entry whose parent directory landed in the live namespace.
+/// Hand every entry whose parent directory landed in the live namespace to
+/// `sink`, prefix line first, without a trailing newline.
+fn emit_paths(
+    fd: i32,
+    ns: &Namespace,
+    prefix: &str,
+    prunes: &[String],
+    sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<u64> {
     let emit = Instant::now();
-    let stdout = io::stdout();
-    let mut out = BufWriter::with_capacity(4 << 20, stdout.lock());
-    out.write_all(prefix.as_bytes())?;
-    out.write_all(b"\n")?;
+    sink(prefix.as_bytes())?;
 
+    let mut line: Vec<u8> = Vec::with_capacity(4096);
     let mut emitted = 0u64;
     for_each_run(fd, BTREE_DIRENTS, |inode, run| {
-        let Some(contexts) = resolved.get(&inode) else {
+        let Some(contexts) = ns
+            .resolved
+            .get(&inode)
+        else {
             return Ok(());
         };
         for (subvol, ctx, path) in contexts {
-            let Some(vis) = vis_cache.get(ctx) else {
+            let Some(vis) = ns
+                .vis_cache
+                .get(ctx)
+            else {
                 continue;
             };
             let Some(r) = choose_visible(run, vis, |r| r.snapshot) else {
@@ -642,44 +698,227 @@ fn cmd_paths(fd: i32, prefix: &str, prunes: &[String], dump_dirs: bool) -> io::R
             }
             if d.d_type == DT_SUBVOL
                 && (d.parent_subvol != *subvol
-                    || !subvols
+                    || !ns
+                        .subvols
                         .get(&d.child_subvol)
                         .is_some_and(|sv| sv.state == SUBVOLUME_STATE_LIVE))
             {
                 continue;
             }
-            out.write_all(path.as_bytes())?;
-            out.write_all(b"/")?;
-            out.write_all(d.name)?;
-            out.write_all(b"\n")?;
+            line.clear();
+            line.extend_from_slice(path.as_bytes());
+            line.push(b'/');
+            line.extend_from_slice(d.name);
+            sink(&line)?;
             emitted += 1;
         }
         Ok(())
     })?;
-    out.flush()?;
     eprintln!(
         "emitted {emitted} paths in {:.2}s",
         emit.elapsed()
             .as_secs_f64()
     );
+    Ok(emitted)
+}
+
+fn cmd_paths(fd: i32, prefix: &str, prunes: &[String], dump_dirs: bool) -> io::Result<()> {
+    let ns = resolve_namespace(fd, prefix, prunes)?;
+    let stdout = io::stdout();
+    let mut out = BufWriter::with_capacity(4 << 20, stdout.lock());
+
+    if dump_dirs {
+        for (inode, ctxs) in &ns.resolved {
+            for (subvol, ctx, path) in ctxs {
+                writeln!(out, "{inode}\t{subvol}\t{ctx}\t{path}")?;
+            }
+        }
+        return out.flush();
+    }
+
+    emit_paths(fd, &ns, prefix, prunes, &mut |line| {
+        out.write_all(line)?;
+        out.write_all(b"\n")
+    })?;
+    out.flush()
+}
+
+fn cmd_build(
+    fd: i32,
+    prefix: &str,
+    prunes: &[String],
+    output: &Path,
+    group: Option<&str>,
+    check_visibility: bool,
+    block_size: usize,
+) -> io::Result<()> {
+    let gid = plocate_db::resolve_group(group)?;
+    let dictionary = plocate_db::read_next_dictionary(output)?;
+    if dictionary.is_empty() {
+        eprintln!("no dictionary to reuse; this run compresses filenames without one");
+    } else {
+        eprintln!(
+            "reusing the {}-byte next dictionary of {}",
+            dictionary.len(),
+            output.display()
+        );
+    }
+    let cdict = if dictionary.is_empty() {
+        None
+    } else {
+        Some(EncoderDictionary::copy(&dictionary, ZSTD_LEVEL))
+    };
+
+    let ns = resolve_namespace(fd, prefix, prunes)?;
+    let mut db = DatabaseBuilder::new(
+        output,
+        Some(gid),
+        block_size,
+        &dictionary,
+        cdict.as_ref(),
+        check_visibility,
+    )?;
+    emit_paths(fd, &ns, prefix, prunes, &mut |line| db.add_file(line))?;
+    let stats = db.finish()?;
+
+    let mb = |bytes: u64| bytes as f64 / 1048576.0;
+    eprintln!(
+        "{} files, {} different trigrams, {} entries, longest {}",
+        stats.num_files, stats.num_trigrams, stats.num_entries, stats.longest_posting_list
+    );
+    eprintln!("Block size:     {block_size:7} files");
+    eprintln!("Dictionary:     {:7.1} MB", mb(stats.bytes_for_dictionary));
+    eprintln!("Hash table:     {:7.1} MB", mb(stats.bytes_for_hashtable));
+    eprintln!(
+        "Posting lists:  {:7.1} MB",
+        mb(stats.bytes_for_posting_lists)
+    );
+    eprintln!(
+        "Filename index: {:7.1} MB",
+        mb(stats.bytes_for_filename_index)
+    );
+    eprintln!("Filenames:      {:7.1} MB", mb(stats.bytes_for_filenames));
+    eprintln!(
+        "Total:          {:7.1} MB",
+        mb(stats.bytes_for_dictionary
+            + stats.bytes_for_hashtable
+            + stats.bytes_for_posting_lists
+            + stats.bytes_for_filename_index
+            + stats.bytes_for_filenames)
+    );
     Ok(())
+}
+
+fn cmd_dbinfo(db: &Path, posting_lists: bool) -> io::Result<()> {
+    let hdr = Header::read(db)?;
+    let stdout = io::stdout();
+    let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
+
+    if !posting_lists {
+        writeln!(out, "magic {}", String::from_utf8_lossy(&hdr.magic[1..]))?;
+        writeln!(out, "version {}", hdr.version)?;
+        writeln!(out, "hashtable_size {}", hdr.hashtable_size)?;
+        writeln!(out, "extra_ht_slots {}", hdr.extra_ht_slots)?;
+        writeln!(out, "num_docids {}", hdr.num_docids)?;
+        writeln!(
+            out,
+            "hash_table_offset_bytes {}",
+            hdr.hash_table_offset_bytes
+        )?;
+        writeln!(
+            out,
+            "filename_index_offset_bytes {}",
+            hdr.filename_index_offset_bytes
+        )?;
+        writeln!(out, "max_version {}", hdr.max_version)?;
+        writeln!(
+            out,
+            "zstd_dictionary_length_bytes {}",
+            hdr.zstd_dictionary_length_bytes
+        )?;
+        writeln!(
+            out,
+            "zstd_dictionary_offset_bytes {}",
+            hdr.zstd_dictionary_offset_bytes
+        )?;
+        writeln!(
+            out,
+            "directory_data_length_bytes {}",
+            hdr.directory_data_length_bytes
+        )?;
+        writeln!(
+            out,
+            "directory_data_offset_bytes {}",
+            hdr.directory_data_offset_bytes
+        )?;
+        writeln!(
+            out,
+            "next_zstd_dictionary_length_bytes {}",
+            hdr.next_zstd_dictionary_length_bytes
+        )?;
+        writeln!(
+            out,
+            "next_zstd_dictionary_offset_bytes {}",
+            hdr.next_zstd_dictionary_offset_bytes
+        )?;
+        writeln!(
+            out,
+            "conf_block_length_bytes {}",
+            hdr.conf_block_length_bytes
+        )?;
+        writeln!(
+            out,
+            "conf_block_offset_bytes {}",
+            hdr.conf_block_offset_bytes
+        )?;
+        writeln!(out, "check_visibility {}", hdr.check_visibility)?;
+        return out.flush();
+    }
+
+    let file = File::open(db)?;
+    let slots = (hdr.hashtable_size as usize)
+        .checked_add(hdr.extra_ht_slots as usize)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| io::Error::other("hash table size overflows"))?;
+    let mut table = vec![0u8; slots * TRIGRAM_SIZE];
+    file.read_exact_at(&mut table, hdr.hash_table_offset_bytes)?;
+
+    let mut entries: Vec<(u32, u32, u64, u64)> = Vec::new();
+    for i in 0..slots - 1 {
+        let slot = Trigram::from_bytes(&table[i * TRIGRAM_SIZE..]);
+        if slot.num_docids == 0 {
+            continue;
+        }
+        let next = Trigram::from_bytes(&table[(i + 1) * TRIGRAM_SIZE..]);
+        entries.push((
+            slot.trgm,
+            slot.num_docids,
+            slot.offset,
+            next.offset - slot.offset,
+        ));
+    }
+    entries.sort_unstable();
+
+    let mut encoded = Vec::new();
+    for (trgm, num_docids, offset, len) in entries {
+        encoded.resize(len as usize, 0);
+        file.read_exact_at(&mut encoded, offset)?;
+        write!(out, "trgm={trgm:06x} n={num_docids} ")?;
+        for byte in &encoded {
+            write!(out, "{byte:02x}")?;
+        }
+        out.write_all(b"\n")?;
+    }
+    out.flush()
 }
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
-    let fs = open_fs(
-        cli.cmd
-            .mount(),
-    )?;
-    let fd = fs.as_raw_fd();
-    check_bcachefs(
-        fd,
-        cli.cmd
-            .mount(),
-    )?;
 
     match cli.cmd {
-        Cmd::Subvols { .. } => {
+        Cmd::Subvols { mount } => {
+            let fs = open_mount(&mount)?;
+            let fd = fs.as_raw_fd();
             let subvols = read_subvols(fd)?;
             let mut ids: Vec<_> = subvols
                 .keys()
@@ -702,7 +941,9 @@ fn main() -> io::Result<()> {
             }
             eprintln!("{} subvolumes", subvols.len());
         }
-        Cmd::Stats { .. } => {
+        Cmd::Stats { mount } => {
+            let fs = open_mount(&mount)?;
+            let fd = fs.as_raw_fd();
             let start = Instant::now();
             let mut by_type = [0u64; 32];
             let mut dirents = 0u64;
@@ -765,7 +1006,9 @@ fn main() -> io::Result<()> {
                 }
             }
         }
-        Cmd::Dump { .. } => {
+        Cmd::Dump { mount } => {
+            let fs = open_mount(&mount)?;
+            let fd = fs.as_raw_fd();
             let stdout = io::stdout();
             let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
             for_each_key(fd, BTREE_DIRENTS, FLAG_ALL_SNAPSHOTS, |k| {
@@ -790,8 +1033,33 @@ fn main() -> io::Result<()> {
             prune,
             dump_dirs,
         } => {
+            let fs = open_mount(&mount)?;
             let prefix = prefix.unwrap_or(mount);
-            cmd_paths(fd, &prefix, &prune, dump_dirs)?;
+            cmd_paths(fs.as_raw_fd(), &prefix, &prune, dump_dirs)?;
+        }
+        Cmd::Build {
+            mount,
+            output,
+            prefix,
+            prune,
+            group,
+            require_visibility,
+            block_size,
+        } => {
+            let fs = open_mount(&mount)?;
+            let prefix = prefix.unwrap_or(mount);
+            cmd_build(
+                fs.as_raw_fd(),
+                &prefix,
+                &prune,
+                Path::new(&output),
+                group.as_deref(),
+                require_visibility,
+                block_size,
+            )?;
+        }
+        Cmd::Dbinfo { db, posting_lists } => {
+            cmd_dbinfo(Path::new(&db), posting_lists)?;
         }
     }
     Ok(())

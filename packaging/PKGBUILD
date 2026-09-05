@@ -1,0 +1,40 @@
+# Maintainer: Jérôme Poulin <jeromepoulin@gmail.com>
+# Builds the checkout it sits in, not a release tarball: this is the local-install
+# path (`makepkg -si` from here), so the sources are already present.
+
+pkgname=bcachefs-updatedb
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='updatedb for bcachefs: builds plocate databases from the dirents btree instead of walking the tree'
+arch=('x86_64' 'aarch64')
+url='https://github.com/ticpu/bcachefs-updatedb'
+license=('GPL-2.0-only')
+depends=('plocate' 'gcc-libs' 'glibc' 'zstd')
+makedepends=('cargo')
+backup=('etc/profile.d/bcachefs-updatedb.sh')
+# The release profile strips, so a debug package would be empty and gdb-add-index
+# fails loudly over it.
+options=('!lto' '!debug')
+
+_repo="$startdir/.."
+
+pkgver() {
+	grep -m1 '^version' "$_repo/Cargo.toml" | cut -d'"' -f2
+}
+
+build() {
+	cargo build --release --manifest-path "$_repo/Cargo.toml" --target-dir "$srcdir/target"
+}
+
+check() {
+	cargo test --release --manifest-path "$_repo/Cargo.toml" --target-dir "$srcdir/target"
+}
+
+package() {
+	install -Dm755 "$srcdir/target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+	install -Dm644 "$_repo/systemd/$pkgname@.service" "$pkgdir/usr/lib/systemd/system/$pkgname@.service"
+	install -Dm644 "$_repo/systemd/$pkgname@.timer" "$pkgdir/usr/lib/systemd/system/$pkgname@.timer"
+	install -Dm644 "$_repo/profile.d/$pkgname.sh" "$pkgdir/etc/profile.d/$pkgname.sh"
+	install -Dm644 "$_repo/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 "$_repo/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

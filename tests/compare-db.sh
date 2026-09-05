@@ -1,6 +1,7 @@
 #!/bin/bash
 # Compare the database written by `build` against plocate-build's, on one
-# bcachefs mount. Needs root: the dirent ioctl does.
+# bcachefs mount. Both databases index the same path list, so churn under the
+# mount cannot skew the comparison. Only the `paths` step needs root.
 set -euo pipefail
 
 if [ $# -lt 2 ]; then
@@ -44,8 +45,8 @@ wc -l "$list"
 echo "== $build -p $list $a"
 "$build" -p "$list" "$a"
 
-echo "== build --output $b"
-"$bin" build "$mount" --output "$b" --group "$group" "${prunes[@]}"
+echo "== build --from-list $list --output $b"
+"$bin" build --from-list "$list" --output "$b" --group "$group"
 
 echo "== posting lists"
 "$bin" dbinfo --posting-lists "$a" >"$workdir/a.pl"
@@ -63,7 +64,7 @@ step "search -r ." compare_search -r .
 
 echo "== second build, over its own database"
 size_before=$(stat -c %s "$b")
-"$bin" build "$mount" --output "$b" --group "$group" "${prunes[@]}" 2>"$workdir/second.log"
+"$bin" build --from-list "$list" --output "$b" --group "$group" 2>"$workdir/second.log"
 cat "$workdir/second.log"
 size_after=$(stat -c %s "$b")
 step "reused the stored dictionary" grep -q "reusing the .* next dictionary" "$workdir/second.log"

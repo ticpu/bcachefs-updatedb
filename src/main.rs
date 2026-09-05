@@ -4,6 +4,7 @@
 use bcachefs_updatedb::plocate_db::{
     self, DatabaseBuilder, Header, TRIGRAM_SIZE, Trigram, ZSTD_LEVEL,
 };
+use bcachefs_updatedb::updatedb_conf;
 use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -385,18 +386,69 @@ where
     Ok(runs)
 }
 
-/// Match `dir/name` against the prune list without building the joined path,
-/// which would allocate once per emitted entry.
-fn is_pruned(prunes: &[String], dir: &str, name: &[u8]) -> bool {
-    prunes
-        .iter()
-        .any(|p| {
-            let b = p.as_bytes();
-            b.len() == dir.len() + 1 + name.len()
-                && b[..dir.len()] == *dir.as_bytes()
-                && b[dir.len()] == b'/'
-                && b[dir.len() + 1..] == *name
-        })
+const DEFAULT_UPDATEDB_CONF: &str = "/etc/updatedb.conf";
+
+/// Exact paths to exclude, and directory names to exclude wherever they occur.
+struct Prunes {
+    paths: Vec<String>,
+    names: HashSet<Vec<u8>>,
+}
+
+impl Prunes {
+    /// Match `dir/name` against the prune list without building the joined path,
+    /// which would allocate once per emitted entry.
+    fn is_pruned(&self, dir: &str, name: &[u8]) -> bool {
+        self.paths
+            .iter()
+            .any(|p| {
+                let b = p.as_bytes();
+                b.len() == dir.len() + 1 + name.len()
+                    && b[..dir.len()] == *dir.as_bytes()
+                    && b[dir.len()] == b'/'
+                    && b[dir.len() + 1..] == *name
+            })
+    }
+
+    fn has_path(&self, path: &str) -> bool {
+        self.paths
+            .iter()
+            .any(|p| p == path)
+    }
+
+    fn is_pruned_name(&self, name: &[u8]) -> bool {
+        self.names
+            .contains(name)
+    }
+}
+
+fn load_prunes(
+    conf: Option<&str>,
+    no_conf: bool,
+    mut paths: Vec<String>,
+    mut names: Vec<String>,
+) -> io::Result<Prunes> {
+    if !no_conf {
+        let path = Path::new(conf.unwrap_or(DEFAULT_UPDATEDB_CONF));
+        if let Some(c) = updatedb_conf::load(path, conf.is_some())? {
+            eprintln!(
+                "{}: {} prune paths, {} prune names",
+                path.display(),
+                c.prunepaths
+                    .len(),
+                c.prunenames
+                    .len()
+            );
+            paths.extend(c.prunepaths);
+            names.extend(c.prunenames);
+        }
+    }
+    Ok(Prunes {
+        paths,
+        names: names
+            .into_iter()
+            .map(String::into_bytes)
+            .collect(),
+    })
 }
 
 fn open_fs(path: &str) -> io::Result<File> {
@@ -438,9 +490,18 @@ enum Cmd {
         /// Path the emitted names are rooted at (default: the mount point).
         #[arg(long, value_name = "PATH")]
         prefix: Option<String>,
-        /// Exact path to exclude, repeatable.
+        /// Exact path to exclude, on top of PRUNEPATHS, repeatable.
         #[arg(long, value_name = "PATH")]
         prune: Vec<String>,
+        /// Directory name to exclude anywhere, on top of PRUNENAMES, repeatable.
+        #[arg(long, value_name = "NAME")]
+        prune_name: Vec<String>,
+        /// Read PRUNEPATHS and PRUNENAMES from FILE (default: /etc/updatedb.conf).
+        #[arg(long, value_name = "FILE")]
+        conf: Option<String>,
+        /// Read no configuration file.
+        #[arg(long, conflicts_with = "conf")]
+        no_conf: bool,
         /// Print the resolved directory paths instead of the file list.
         #[arg(long)]
         dump_dirs: bool,
@@ -451,7 +512,7 @@ enum Cmd {
         /// Mount point of the bcachefs filesystem.
         mount: Option<String>,
         /// Index the newline-delimited paths of FILE instead of scanning a mount.
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["prefix", "prune"])]
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["prefix", "prune", "prune_name", "conf", "no_conf"])]
         from_list: Option<String>,
         /// Database to write, replaced atomically.
         #[arg(long, value_name = "DB")]
@@ -459,9 +520,18 @@ enum Cmd {
         /// Path the indexed names are rooted at (default: the mount point).
         #[arg(long, value_name = "PATH")]
         prefix: Option<String>,
-        /// Exact path to exclude, repeatable.
+        /// Exact path to exclude, on top of PRUNEPATHS, repeatable.
         #[arg(long, value_name = "PATH")]
         prune: Vec<String>,
+        /// Directory name to exclude anywhere, on top of PRUNENAMES, repeatable.
+        #[arg(long, value_name = "NAME")]
+        prune_name: Vec<String>,
+        /// Read PRUNEPATHS and PRUNENAMES from FILE (default: /etc/updatedb.conf).
+        #[arg(long, value_name = "FILE")]
+        conf: Option<String>,
+        /// Read no configuration file.
+        #[arg(long, conflicts_with = "conf")]
+        no_conf: bool,
         /// Group owning the database (default: the group of the setgid plocate on PATH).
         #[arg(long, value_name = "NAME")]
         group: Option<String>,
@@ -519,7 +589,7 @@ struct Namespace {
     vis_cache: HashMap<u32, HashMap<u32, u32>>,
 }
 
-fn resolve_namespace(fd: i32, prefix: &str, prunes: &[String]) -> io::Result<Namespace> {
+fn resolve_namespace(fd: i32, prefix: &str, prunes: &Prunes) -> io::Result<Namespace> {
     let subvols = read_subvols(fd)?;
     let snaps = read_snapshots(fd)?;
     eprintln!("{} subvolumes, {} snapshots", subvols.len(), snaps.len());
@@ -623,10 +693,13 @@ fn resolve_namespace(fd: i32, prefix: &str, prunes: &[String]) -> io::Result<Nam
             {
                 continue; // whiteout won
             }
+            if prunes.is_pruned_name(&c.name) {
+                continue;
+            }
             let mut child_path = path.clone();
             child_path.push('/');
             child_path.push_str(&String::from_utf8_lossy(&c.name));
-            if prunes.contains(&child_path) {
+            if prunes.has_path(&child_path) {
                 continue;
             }
             let (nsubvol, nctx, ninode) = if c.is_subvol {
@@ -668,7 +741,7 @@ fn emit_paths(
     fd: i32,
     ns: &Namespace,
     prefix: &str,
-    prunes: &[String],
+    prunes: &Prunes,
     sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<u64> {
     let emit = Instant::now();
@@ -697,7 +770,10 @@ fn emit_paths(
                 continue;
             }
             let d = parse_dirent(&r.bytes).ok_or_else(|| unparsable(&r.bytes))?;
-            if is_pruned(prunes, path, d.name) {
+            if prunes.is_pruned(path, d.name) {
+                continue;
+            }
+            if (d.d_type == DT_DIR || d.d_type == DT_SUBVOL) && prunes.is_pruned_name(d.name) {
                 continue;
             }
             if d.d_type == DT_SUBVOL
@@ -726,7 +802,7 @@ fn emit_paths(
     Ok(emitted)
 }
 
-fn cmd_paths(fd: i32, prefix: &str, prunes: &[String], dump_dirs: bool) -> io::Result<()> {
+fn cmd_paths(fd: i32, prefix: &str, prunes: &Prunes, dump_dirs: bool) -> io::Result<()> {
     let ns = resolve_namespace(fd, prefix, prunes)?;
     let stdout = io::stdout();
     let mut out = BufWriter::with_capacity(4 << 20, stdout.lock());
@@ -773,7 +849,7 @@ enum Source<'a> {
     Scan {
         fd: i32,
         prefix: &'a str,
-        prunes: &'a [String],
+        prunes: &'a Prunes,
     },
     List(&'a Path),
 }
@@ -1069,11 +1145,15 @@ fn main() -> io::Result<()> {
             mount,
             prefix,
             prune,
+            prune_name,
+            conf,
+            no_conf,
             dump_dirs,
         } => {
+            let prunes = load_prunes(conf.as_deref(), no_conf, prune, prune_name)?;
             let fs = open_mount(&mount)?;
             let prefix = prefix.unwrap_or(mount);
-            cmd_paths(fs.as_raw_fd(), &prefix, &prune, dump_dirs)?;
+            cmd_paths(fs.as_raw_fd(), &prefix, &prunes, dump_dirs)?;
         }
         Cmd::Build {
             mount,
@@ -1081,18 +1161,22 @@ fn main() -> io::Result<()> {
             output,
             prefix,
             prune,
+            prune_name,
+            conf,
+            no_conf,
             group,
             require_visibility,
             block_size,
         } => match (mount, from_list) {
             (Some(mount), None) => {
+                let prunes = load_prunes(conf.as_deref(), no_conf, prune, prune_name)?;
                 let fs = open_mount(&mount)?;
                 let prefix = prefix.unwrap_or(mount);
                 cmd_build(
                     Source::Scan {
                         fd: fs.as_raw_fd(),
                         prefix: &prefix,
-                        prunes: &prune,
+                        prunes: &prunes,
                     },
                     Path::new(&output),
                     group.as_deref(),

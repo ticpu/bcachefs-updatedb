@@ -2,3 +2,4 @@
 
 pub mod plocate_db;
 pub mod turbopfor;
+pub mod updatedb_conf;

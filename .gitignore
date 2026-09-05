@@ -1,2 +1,8 @@
 /target
 /Cargo.lock
+/dist
+/package.tmp
+/*.deb
+/packaging/pkg
+/packaging/src
+/packaging/*.pkg.tar.zst

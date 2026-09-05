@@ -7,7 +7,7 @@ use bcachefs_updatedb::plocate_db::{
 use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
@@ -446,9 +446,13 @@ enum Cmd {
         dump_dirs: bool,
     },
     /// Write a plocate database from the live namespace.
+    #[command(group = clap::ArgGroup::new("source").required(true).multiple(false).args(["mount", "from_list"]))]
     Build {
         /// Mount point of the bcachefs filesystem.
-        mount: String,
+        mount: Option<String>,
+        /// Index the newline-delimited paths of FILE instead of scanning a mount.
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["prefix", "prune"])]
+        from_list: Option<String>,
         /// Database to write, replaced atomically.
         #[arg(long, value_name = "DB")]
         output: String,
@@ -743,10 +747,39 @@ fn cmd_paths(fd: i32, prefix: &str, prunes: &[String], dump_dirs: bool) -> io::R
     out.flush()
 }
 
+/// Hand every line of `list` to `sink`, newline stripped, in file order. The
+/// list already carries the prefix line, so none is added.
+fn feed_list(list: &Path, sink: &mut dyn FnMut(&[u8]) -> io::Result<()>) -> io::Result<u64> {
+    let read = Instant::now();
+    let file = File::open(list)?;
+    let mut count = 0u64;
+    for line in BufReader::with_capacity(4 << 20, file).split(b'\n') {
+        sink(&line?)?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(io::Error::other(format!("{} is empty", list.display())));
+    }
+    eprintln!(
+        "read {count} paths from {} in {:.2}s",
+        list.display(),
+        read.elapsed()
+            .as_secs_f64()
+    );
+    Ok(count)
+}
+
+enum Source<'a> {
+    Scan {
+        fd: i32,
+        prefix: &'a str,
+        prunes: &'a [String],
+    },
+    List(&'a Path),
+}
+
 fn cmd_build(
-    fd: i32,
-    prefix: &str,
-    prunes: &[String],
+    source: Source<'_>,
     output: &Path,
     group: Option<&str>,
     check_visibility: bool,
@@ -769,7 +802,6 @@ fn cmd_build(
         Some(EncoderDictionary::copy(&dictionary, ZSTD_LEVEL))
     };
 
-    let ns = resolve_namespace(fd, prefix, prunes)?;
     let mut db = DatabaseBuilder::new(
         output,
         Some(gid),
@@ -778,7 +810,13 @@ fn cmd_build(
         cdict.as_ref(),
         check_visibility,
     )?;
-    emit_paths(fd, &ns, prefix, prunes, &mut |line| db.add_file(line))?;
+    match source {
+        Source::Scan { fd, prefix, prunes } => {
+            let ns = resolve_namespace(fd, prefix, prunes)?;
+            emit_paths(fd, &ns, prefix, prunes, &mut |line| db.add_file(line))?
+        }
+        Source::List(list) => feed_list(list, &mut |line| db.add_file(line))?,
+    };
     let stats = db.finish()?;
 
     let mb = |bytes: u64| bytes as f64 / 1048576.0;
@@ -1039,25 +1077,44 @@ fn main() -> io::Result<()> {
         }
         Cmd::Build {
             mount,
+            from_list,
             output,
             prefix,
             prune,
             group,
             require_visibility,
             block_size,
-        } => {
-            let fs = open_mount(&mount)?;
-            let prefix = prefix.unwrap_or(mount);
-            cmd_build(
-                fs.as_raw_fd(),
-                &prefix,
-                &prune,
-                Path::new(&output),
-                group.as_deref(),
-                require_visibility,
-                block_size,
-            )?;
-        }
+        } => match (mount, from_list) {
+            (Some(mount), None) => {
+                let fs = open_mount(&mount)?;
+                let prefix = prefix.unwrap_or(mount);
+                cmd_build(
+                    Source::Scan {
+                        fd: fs.as_raw_fd(),
+                        prefix: &prefix,
+                        prunes: &prune,
+                    },
+                    Path::new(&output),
+                    group.as_deref(),
+                    require_visibility,
+                    block_size,
+                )?;
+            }
+            (None, Some(list)) => {
+                cmd_build(
+                    Source::List(Path::new(&list)),
+                    Path::new(&output),
+                    group.as_deref(),
+                    require_visibility,
+                    block_size,
+                )?;
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "exactly one of <MOUNT> and --from-list is required",
+                ));
+            }
+        },
         Cmd::Dbinfo { db, posting_lists } => {
             cmd_dbinfo(Path::new(&db), posting_lists)?;
         }

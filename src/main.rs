@@ -26,6 +26,9 @@ const DIRENT_NAME_OFF: usize = 9;
 const DIRENT_CF_NAME_LEN_OFF: usize = 11;
 const DIRENT_CF_NAMES_OFF: usize = 15;
 
+/// BCACHEFS_STATFS_MAGIC, i.e. BCACHEFS_SUPER_MAGIC of linux/magic.h.
+const BCACHEFS_STATFS_MAGIC: u64 = 0xca45_1a4e;
+
 const DT_DIR: u8 = 4;
 const DT_SUBVOL: u8 = 16;
 
@@ -394,6 +397,25 @@ fn open_fs(path: &str) -> io::Result<File> {
     File::open(path)
 }
 
+/// The btree ioctl answers ENOTTY on every other filesystem, which names
+/// neither the path nor the reason.
+fn check_bcachefs(fd: i32, path: &str) -> io::Result<()> {
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(fd, st.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let f_type = unsafe {
+        st.assume_init()
+            .f_type
+    } as u64;
+    if f_type != BCACHEFS_STATFS_MAGIC {
+        return Err(io::Error::other(format!(
+            "{path} is not a bcachefs mount: statfs f_type {f_type:#x}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "bcachefs-updatedb", version, about)]
 struct Cli {
@@ -650,6 +672,11 @@ fn main() -> io::Result<()> {
             .mount(),
     )?;
     let fd = fs.as_raw_fd();
+    check_bcachefs(
+        fd,
+        cli.cmd
+            .mount(),
+    )?;
 
     match cli.cmd {
         Cmd::Subvols { .. } => {

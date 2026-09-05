@@ -1,6 +1,7 @@
 //! Build a filename list from a mounted bcachefs by streaming the dirents btree
 //! through BCH_IOCTL_QUERY_BTREE_KEYS, instead of walking it with readdir.
 
+use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -393,7 +394,58 @@ fn open_fs(path: &str) -> io::Result<File> {
     File::open(path)
 }
 
-fn cmd_paths(fd: i32, prefix: &str, prunes: &[String]) -> io::Result<()> {
+#[derive(Parser)]
+#[command(name = "bcachefs-updatedb", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Print every path reachable in the live namespace.
+    Paths {
+        /// Mount point of the bcachefs filesystem.
+        mount: String,
+        /// Path the emitted names are rooted at (default: the mount point).
+        #[arg(long, value_name = "PATH")]
+        prefix: Option<String>,
+        /// Exact path to exclude, repeatable.
+        #[arg(long, value_name = "PATH")]
+        prune: Vec<String>,
+        /// Print the resolved directory paths instead of the file list.
+        #[arg(long)]
+        dump_dirs: bool,
+    },
+    /// Count dirent keys and name bytes by type.
+    Stats {
+        /// Mount point of the bcachefs filesystem.
+        mount: String,
+    },
+    /// Print every dirent key, all snapshots included.
+    Dump {
+        /// Mount point of the bcachefs filesystem.
+        mount: String,
+    },
+    /// List subvolumes with their snapshot, root inode and state.
+    Subvols {
+        /// Mount point of the bcachefs filesystem.
+        mount: String,
+    },
+}
+
+impl Cmd {
+    fn mount(&self) -> &str {
+        match self {
+            Cmd::Paths { mount, .. }
+            | Cmd::Stats { mount }
+            | Cmd::Dump { mount }
+            | Cmd::Subvols { mount } => mount,
+        }
+    }
+}
+
+fn cmd_paths(fd: i32, prefix: &str, prunes: &[String], dump_dirs: bool) -> io::Result<()> {
     let subvols = read_subvols(fd)?;
     let snaps = read_snapshots(fd)?;
     eprintln!("{} subvolumes, {} snapshots", subvols.len(), snaps.len());
@@ -529,7 +581,7 @@ fn cmd_paths(fd: i32, prefix: &str, prunes: &[String]) -> io::Result<()> {
     }
     eprintln!("resolved {} directory paths", resolved.len());
 
-    if std::env::var_os("DIRENT_DUMP_DIRS").is_some() {
+    if dump_dirs {
         let stdout = io::stdout();
         let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
         for (inode, ctxs) in &resolved {
@@ -592,16 +644,15 @@ fn cmd_paths(fd: i32, prefix: &str, prunes: &[String]) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: {} <mountpoint> <stats|dump|subvols>", args[0]);
-        std::process::exit(2);
-    }
-    let fs = open_fs(&args[1])?;
+    let cli = Cli::parse();
+    let fs = open_fs(
+        cli.cmd
+            .mount(),
+    )?;
     let fd = fs.as_raw_fd();
 
-    match args[2].as_str() {
-        "subvols" => {
+    match cli.cmd {
+        Cmd::Subvols { .. } => {
             let subvols = read_subvols(fd)?;
             let mut ids: Vec<_> = subvols
                 .keys()
@@ -624,7 +675,7 @@ fn main() -> io::Result<()> {
             }
             eprintln!("{} subvolumes", subvols.len());
         }
-        "stats" => {
+        Cmd::Stats { .. } => {
             let start = Instant::now();
             let mut by_type = [0u64; 32];
             let mut dirents = 0u64;
@@ -687,7 +738,7 @@ fn main() -> io::Result<()> {
                 }
             }
         }
-        "dump" => {
+        Cmd::Dump { .. } => {
             let stdout = io::stdout();
             let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
             for_each_key(fd, BTREE_DIRENTS, FLAG_ALL_SNAPSHOTS, |k| {
@@ -706,16 +757,14 @@ fn main() -> io::Result<()> {
             })?;
             out.flush()?;
         }
-        "paths" => {
-            let prefix = args
-                .get(3)
-                .map(String::as_str)
-                .unwrap_or(&args[1]);
-            cmd_paths(fd, prefix, &args[4..])?;
-        }
-        other => {
-            eprintln!("unknown mode {other}");
-            std::process::exit(2);
+        Cmd::Paths {
+            mount,
+            prefix,
+            prune,
+            dump_dirs,
+        } => {
+            let prefix = prefix.unwrap_or(mount);
+            cmd_paths(fd, &prefix, &prune, dump_dirs)?;
         }
     }
     Ok(())

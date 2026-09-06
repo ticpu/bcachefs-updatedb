@@ -32,9 +32,9 @@ On-disk structure layouts carry no compatibility promise. The tool must refuse t
 
 The database is readable only through the search binary's setgid group, and distributions name that group differently. The group is taken from the installed search binary unless told otherwise, so one unit file serves every distribution and a build that finds no such binary fails instead of writing a database nobody can read.
 
-## Pruning is exact paths
+## Pruning follows the system indexer's configuration
 
-The tool prunes only paths given to it, never names or filesystem types. Name-based rules already live in the system indexer's configuration; a second dialect here would have to track it. Whoever runs the tool derives the paths from that configuration.
+Prune rules are read from the system indexer's configuration file, in its grammar, so one file governs both indexers and a second dialect never has to track it. Only the path and directory-name rules apply: filesystem-type and bind-mount rules select mounts, and this tool indexes exactly one. Command-line prunes extend the file's rules and never replace them. A pruned entry is dropped along with everything under it; the system indexer keeps the entry itself, and that difference is accepted rather than mirrored, so a pruned path never surfaces as a hit.
 
 ## One filesystem per index
 

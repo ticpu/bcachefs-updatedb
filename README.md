@@ -37,9 +37,9 @@ same stream as text for `plocate-build -p` or for diffing against `find`.
 
 ## Performance
 
-Measured with this binary, `/usr/bin/time -v`, output to `/dev/null` for `paths`. Both
-machines run a Ryzen 9 7950X3D. "Live tree" prunes the snapshots directory; "all" indexes
-every snapshot.
+Measured with this binary, `/usr/bin/time -v`, output to `/dev/null` for `paths`, no
+configuration file (`--no-conf`). Both machines run a Ryzen 9 7950X3D. "Live tree"
+prunes the snapshots directory; "all" indexes every snapshot.
 
 **p4**: 64 GB RAM, kernel 7.1.9, bcachefs DKMS 1.39.2, 13.6 TB filesystem (8.8 TB used) on
 four HDDs and two NVMe, 208 subvolumes, 22 428 snapshots, 15.2 M dirent keys (34.2 M
@@ -56,8 +56,8 @@ keys with whiteouts).
 
 The readdir-based `updatedb` job that used to index the snapshots portion of this
 filesystem took 1 h 47 min and 6.98 GB, and produced a 4.07 GB database. Path counts are
-not comparable: `updatedb` applied PRUNENAMES, this tool prunes only the paths it is
-given. The claim is the wall time.
+not comparable: `updatedb` applied PRUNENAMES, these runs pruned one path. The claim is
+the wall time.
 
 **castgti86**: 32 GB RAM, kernel 7.2.2, DKMS 1.39.4, 734 GB filesystem (308 GB used) on
 LVM-on-LUKS NVMe plus one HDD, 521 subvolumes, 39 364 snapshots, 7.6 M dirent keys
@@ -91,10 +91,12 @@ the full input, this tool takes it from the previous database like `updatedb`.
 ## Usage
 
 ```
-bcachefs-updatedb build <mount> --output DB [--prefix P] [--prune PATH]... [--group G]
+bcachefs-updatedb build <mount> --output DB [--prefix P] [--conf FILE | --no-conf]
+                        [--prune PATH]... [--prune-name NAME]... [--group G]
                         [--require-visibility BOOL] [--block-size N]
 bcachefs-updatedb build --from-list FILE --output DB [--group G] ...
-bcachefs-updatedb paths <mount> [--prefix P] [--prune PATH]... [--dump-dirs]
+bcachefs-updatedb paths <mount> [--prefix P] [--conf FILE | --no-conf] [--prune PATH]...
+                        [--prune-name NAME]... [--dump-dirs]
 bcachefs-updatedb stats <mount>
 bcachefs-updatedb dump <mount>
 bcachefs-updatedb subvols <mount>
@@ -103,9 +105,12 @@ bcachefs-updatedb dbinfo <db> [--posting-lists]
 
 - `--prefix` is the path users see the filesystem at; default is the mount argument.
   plocate checks visibility against that path, so it must match the real mount.
-- `--prune` takes exact paths in prefixed form. The pruned entry itself is not emitted,
-  files can be pruned as well as directories, and there is no name or filesystem-type
-  pruning: derive the list from your `updatedb.conf` if you need one.
+- Pruning comes from `/etc/updatedb.conf`, the same file `updatedb` reads and in its
+  grammar: `PRUNEPATHS` are exact paths in prefixed form, `PRUNENAMES` are directory
+  names matched anywhere. `PRUNEFS` and `PRUNE_BIND_MOUNTS` are parsed and ignored,
+  since one filesystem is indexed. `--conf` reads another file, `--no-conf` none;
+  `--prune` and `--prune-name` add to whatever the file says. Unlike `updatedb`, the
+  pruned entry itself is not emitted, and `--prune` also accepts a file path.
 - `--group` names the group that owns the database. Without it, the group of the
   setgid `plocate` binary on PATH is used and printed; if there is none, the build
   fails rather than write a database only root can read.
@@ -127,8 +132,9 @@ in a container), then install the `.deb`.
 Both ship `bcachefs-updatedb@.service` and `.timer`, instanced on the escaped mount
 path, and `/etc/profile.d/bcachefs-updatedb.sh`. After installing:
 
-1. Add `bcachefs` to `PRUNEFS` in `/etc/updatedb.conf`, or `updatedb` indexes the same
-   files again. The mount directory itself still appears in both databases.
+1. In `/etc/updatedb.conf`, add `bcachefs` to `PRUNEFS`, or `updatedb` indexes the same
+   files again (the mount directory itself still appears in both databases), and add
+   the snapshots directory to `PRUNEPATHS` unless you want every snapshot indexed.
 2. `systemctl enable --now bcachefs-updatedb@$(systemd-escape --path /mnt/fs).timer`
    per filesystem. The database lands in `/var/lib/plocate/bcachefs-<instance>.db`; a
    dash in the mount path becomes `\x2d` in the instance, and `/` is instance `-`.

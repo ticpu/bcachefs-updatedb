@@ -9,6 +9,7 @@ authors = ["Jérôme Poulin <jeromepoulin@gmail.com>"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+hashbrown = "0.15"
 libc = "0.2"
 rand = "0.9"
 tempfile = "3"

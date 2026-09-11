@@ -6,8 +6,10 @@ use bcachefs_updatedb::plocate_db::{
 };
 use bcachefs_updatedb::updatedb_conf;
 use clap::{Parser, Subcommand};
+use hashbrown::HashTable;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::hash::{BuildHasher, RandomState};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
@@ -338,14 +340,103 @@ fn ancestry(snap: u32, snaps: &HashMap<u32, SnapNode>) -> HashMap<u32, u32> {
     out
 }
 
+/// Name id of a whiteout, which carries no name.
+const NAME_WHITEOUT: u32 = u32::MAX;
+/// Parent of a root node.
+const NODE_NONE: u32 = u32::MAX;
+
 struct DirChild {
-    snapshot: u32,
     hash: u64,
-    name: Vec<u8>,
     target: u64,
+    snapshot: u32,
+    name: u32,
     child_subvol: u32,
     parent_subvol: u32,
     is_subvol: bool,
+}
+
+/// Distinct name byte strings, each stored once in one arena.
+struct Names {
+    arena: Vec<u8>,
+    spans: Vec<(u32, u32)>,
+    table: HashTable<u32>,
+    hasher: RandomState,
+}
+
+fn span<'a>(arena: &'a [u8], spans: &[(u32, u32)], id: u32) -> &'a [u8] {
+    let (off, len) = spans[id as usize];
+    &arena[off as usize..off as usize + len as usize]
+}
+
+impl Names {
+    fn new() -> Self {
+        Names {
+            arena: Vec::new(),
+            spans: Vec::new(),
+            table: HashTable::new(),
+            hasher: RandomState::new(),
+        }
+    }
+
+    fn get(&self, id: u32) -> &[u8] {
+        span(&self.arena, &self.spans, id)
+    }
+
+    fn intern(&mut self, name: &[u8]) -> u32 {
+        let Names {
+            arena,
+            spans,
+            table,
+            hasher,
+        } = self;
+        let h = hasher.hash_one(name);
+        if let Some(&id) = table.find(h, |&id| span(arena, spans, id) == name) {
+            return id;
+        }
+        let off = u32::try_from(arena.len()).expect("name arena grew past 4 GiB");
+        let id = u32::try_from(spans.len()).expect("more than 4 G distinct names");
+        arena.extend_from_slice(name);
+        spans.push((off, name.len() as u32));
+        table.insert_unique(h, id, |&other| hasher.hash_one(span(arena, spans, other)));
+        id
+    }
+}
+
+/// A resolved directory: where it hangs and what it is called. Nodes are appended
+/// as they are discovered, so a parent id is always below its children's.
+struct DirNode {
+    parent: u32,
+    name: u32,
+}
+
+fn push_lossy(out: &mut Vec<u8>, name: &[u8]) {
+    match std::str::from_utf8(name) {
+        Ok(s) => out.extend_from_slice(s.as_bytes()),
+        Err(_) => out.extend_from_slice(String::from_utf8_lossy(name).as_bytes()),
+    }
+}
+
+/// Write the path of `node` into `out`, root component first and verbatim, every
+/// other component as lossy UTF-8. `stack` is scratch.
+fn path_of(nodes: &[DirNode], names: &Names, node: u32, out: &mut Vec<u8>, stack: &mut Vec<u32>) {
+    out.clear();
+    stack.clear();
+    let mut cur = node;
+    while cur != NODE_NONE {
+        stack.push(cur);
+        cur = nodes[cur as usize].parent;
+    }
+    let mut first = true;
+    while let Some(n) = stack.pop() {
+        let name = names.get(nodes[n as usize].name);
+        if first {
+            out.extend_from_slice(name);
+            first = false;
+        } else {
+            out.push(b'/');
+            push_lossy(out, name);
+        }
+    }
 }
 
 /// Pick, for each entry position, the version nearest the subvolume's snapshot.
@@ -417,22 +508,22 @@ struct Filter {
 impl Filter {
     /// Match `dir/name` against the prune list without building the joined path,
     /// which would allocate once per emitted entry.
-    fn is_pruned(&self, dir: &str, name: &[u8]) -> bool {
+    fn is_pruned(&self, dir: &[u8], name: &[u8]) -> bool {
         self.paths
             .iter()
             .any(|p| {
                 let b = p.as_bytes();
                 b.len() == dir.len() + 1 + name.len()
-                    && b[..dir.len()] == *dir.as_bytes()
+                    && b[..dir.len()] == *dir
                     && b[dir.len()] == b'/'
                     && b[dir.len() + 1..] == *name
             })
     }
 
-    fn has_path(&self, path: &str) -> bool {
+    fn has_path(&self, path: &[u8]) -> bool {
         self.paths
             .iter()
-            .any(|p| p == path)
+            .any(|p| p.as_bytes() == path)
     }
 
     fn is_pruned_name(&self, name: &[u8]) -> bool {
@@ -613,8 +704,23 @@ fn open_mount(mount: &str) -> io::Result<File> {
 /// under, and the ancestry set of each subvolume context.
 struct Namespace {
     subvols: HashMap<u32, Subvol>,
-    resolved: HashMap<u64, Vec<(u32, u32, String)>>,
+    ctx_subvol: HashMap<u32, u32>,
+    names: Names,
+    nodes: Vec<DirNode>,
+    resolved: HashMap<u64, Vec<(u32, u32)>>,
     vis_cache: HashMap<u32, HashMap<u32, u32>>,
+}
+
+/// Contexts are subvolume snapshot ids, so the map always holds one.
+fn subvol_of(ctx_subvol: &HashMap<u32, u32>, ctx: u32) -> u32 {
+    ctx_subvol[&ctx]
+}
+
+/// The dedupe set of a context being walked, dropped once its last queued item pops.
+#[derive(Default)]
+struct CtxWalk {
+    pending: usize,
+    seen: HashSet<u64>,
 }
 
 fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Namespace> {
@@ -627,6 +733,7 @@ fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Names
         .ok_or_else(|| io::Error::other("no root subvolume"))?;
 
     let scan = Instant::now();
+    let mut names = Names::new();
     let mut dir_children: HashMap<u64, Vec<DirChild>> = HashMap::new();
     for_each_run(fd, BTREE_DIRENTS, |inode, run| {
         let interesting = run
@@ -649,11 +756,9 @@ fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Names
                     let d = parse_dirent(&r.bytes).ok_or_else(|| unparsable(&r.bytes))?;
                     if d.d_type == DT_DIR || d.d_type == DT_SUBVOL {
                         slot.push(DirChild {
-                            snapshot: r.snapshot,
                             hash,
-                            name: d
-                                .name
-                                .to_vec(),
+                            snapshot: r.snapshot,
+                            name: names.intern(d.name),
                             target: d.target,
                             child_subvol: d.child_subvol,
                             parent_subvol: d.parent_subvol,
@@ -663,9 +768,9 @@ fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Names
                 }
                 // A whiteout hides the entry in this snapshot and below.
                 _ => slot.push(DirChild {
-                    snapshot: r.snapshot,
                     hash,
-                    name: Vec::new(),
+                    snapshot: r.snapshot,
+                    name: NAME_WHITEOUT,
                     target: 0,
                     child_subvol: 0,
                     parent_subvol: 0,
@@ -682,82 +787,121 @@ fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Names
             .as_secs_f64()
     );
 
-    // Walk the live namespace, recording the path of every reachable directory.
     // Snapshot subvolumes reuse inode numbers, so one inode can hold several
-    // live paths and each must be keyed by the subvolume context it came from.
-    let mut resolved: HashMap<u64, Vec<(u32, u32, String)>> = HashMap::new();
-    let mut seen: HashSet<(u32, u64)> = HashSet::new();
+    // live nodes and each must be keyed by the subvolume context it came from.
+    let ctx_subvol: HashMap<u32, u32> = subvols
+        .iter()
+        .map(|(id, sv)| (sv.snapshot, *id))
+        .collect();
+    let mut resolved: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
+    let mut walk: HashMap<u32, CtxWalk> = HashMap::new();
     let mut vis_cache: HashMap<u32, HashMap<u32, u32>> = HashMap::new();
-    let mut queue = vec![(1u32, root.snapshot, root.root_inode, prefix.to_string())];
+    let mut nodes = vec![DirNode {
+        parent: NODE_NONE,
+        name: names.intern(prefix.as_bytes()),
+    }];
+    let mut queue = vec![(root.snapshot, root.root_inode, 0u32)];
+    let mut dups = 0u64;
+    let mut path: Vec<u8> = Vec::with_capacity(4096);
+    let mut stack: Vec<u32> = Vec::new();
     resolved
         .entry(root.root_inode)
         .or_default()
-        .push((1, root.snapshot, prefix.to_string()));
-    seen.insert((root.snapshot, root.root_inode));
+        .push((root.snapshot, 0));
+    let w = walk
+        .entry(root.snapshot)
+        .or_default();
+    w.pending = 1;
+    w.seen
+        .insert(root.root_inode);
 
-    while let Some((subvol, ctx, inode, path)) = queue.pop() {
+    while let Some((ctx, inode, node)) = queue.pop() {
         // Every reachable context needs an ancestry set, including one whose
         // directory holds only files: the emit pass looks it up per entry.
         let vis = vis_cache
             .entry(ctx)
             .or_insert_with(|| ancestry(ctx, &snaps));
-        let Some(children) = dir_children.get(&inode) else {
-            continue;
-        };
-
-        let mut by_hash: HashMap<u64, Vec<&DirChild>> = HashMap::new();
-        for c in children {
-            by_hash
-                .entry(c.hash)
-                .or_default()
-                .push(c);
-        }
-        for (_, run) in by_hash {
-            let Some(c) = choose_visible(&run, vis, |c| c.snapshot) else {
-                continue;
-            };
-            if c.name
-                .is_empty()
-            {
-                continue; // whiteout won
-            }
-            if filter.is_pruned_name(&c.name) {
-                continue;
-            }
-            let mut child_path = path.clone();
-            child_path.push('/');
-            child_path.push_str(&String::from_utf8_lossy(&c.name));
-            if filter.has_path(&child_path) {
-                continue;
-            }
-            let (nsubvol, nctx, ninode) = if c.is_subvol {
-                // A subvolume dirent belongs to one parent subvolume. Snapshots
-                // of that parent share the key but must not show the child.
-                if c.parent_subvol != subvol {
+        if let Some(children) = dir_children.get(&inode) {
+            let subvol = subvol_of(&ctx_subvol, ctx);
+            path_of(&nodes, &names, node, &mut path, &mut stack);
+            let parent_len = path.len();
+            for run in children.chunk_by(|a, b| a.hash == b.hash) {
+                let Some(c) = choose_visible(run, vis, |c| c.snapshot) else {
+                    continue;
+                };
+                if c.name == NAME_WHITEOUT {
                     continue;
                 }
-                match subvols.get(&c.child_subvol) {
-                    Some(sv) if sv.enterable(filter.skip_snapshots) => {
-                        (c.child_subvol, sv.snapshot, sv.root_inode)
-                    }
-                    _ => continue,
+                let name = names.get(c.name);
+                if filter.is_pruned_name(name) {
+                    continue;
                 }
-            } else {
-                (subvol, ctx, c.target)
-            };
-            if seen.insert((nctx, ninode)) {
+                path.truncate(parent_len);
+                path.push(b'/');
+                push_lossy(&mut path, name);
+                if filter.has_path(&path) {
+                    continue;
+                }
+                let (nctx, ninode) = if c.is_subvol {
+                    // A subvolume dirent belongs to one parent subvolume. Snapshots
+                    // of that parent share the key but must not show the child.
+                    if c.parent_subvol != subvol {
+                        continue;
+                    }
+                    match subvols.get(&c.child_subvol) {
+                        Some(sv) if sv.enterable(filter.skip_snapshots) => {
+                            (sv.snapshot, sv.root_inode)
+                        }
+                        _ => continue,
+                    }
+                } else {
+                    (ctx, c.target)
+                };
+                let w = walk
+                    .entry(nctx)
+                    .or_default();
+                if !w
+                    .seen
+                    .insert(ninode)
+                {
+                    dups += 1;
+                    continue;
+                }
+                w.pending += 1;
+                let child = u32::try_from(nodes.len()).expect("more than 4 G resolved directories");
+                nodes.push(DirNode {
+                    parent: node,
+                    name: c.name,
+                });
                 resolved
                     .entry(ninode)
                     .or_default()
-                    .push((nsubvol, nctx, child_path.clone()));
-                queue.push((nsubvol, nctx, ninode, child_path));
+                    .push((nctx, child));
+                queue.push((nctx, ninode, child));
             }
         }
+        let w = walk
+            .get_mut(&ctx)
+            .expect("a queued item holds its context entry");
+        w.pending -= 1;
+        if w.pending == 0 {
+            walk.remove(&ctx);
+        }
     }
-    eprintln!("resolved {} directory paths", resolved.len());
+    for v in resolved.values_mut() {
+        v.shrink_to_fit();
+    }
+    eprintln!(
+        "resolved {} directories in {} contexts, {dups} duplicate parents skipped",
+        nodes.len(),
+        vis_cache.len()
+    );
 
     Ok(Namespace {
         subvols,
+        ctx_subvol,
+        names,
+        nodes,
         resolved,
         vis_cache,
     })
@@ -776,18 +920,34 @@ fn emit_paths(
     sink(prefix.as_bytes())?;
 
     let mut line: Vec<u8> = Vec::with_capacity(4096);
+    let mut paths_buf: Vec<u8> = Vec::new();
+    let mut ctx_paths: Vec<(u32, u32, usize, usize)> = Vec::new();
+    let mut path_buf: Vec<u8> = Vec::new();
+    let mut stack: Vec<u32> = Vec::new();
+    let mut cur_inode: Option<u64> = None;
     let mut emitted = 0u64;
     for_each_run(fd, BTREE_DIRENTS, |inode, run| {
-        let Some(contexts) = ns
-            .resolved
-            .get(&inode)
-        else {
-            return Ok(());
-        };
-        for (subvol, ctx, path) in contexts {
+        if cur_inode != Some(inode) {
+            cur_inode = Some(inode);
+            ctx_paths.clear();
+            paths_buf.clear();
+            if let Some(contexts) = ns
+                .resolved
+                .get(&inode)
+            {
+                for &(ctx, node) in contexts {
+                    path_of(&ns.nodes, &ns.names, node, &mut path_buf, &mut stack);
+                    let start = paths_buf.len();
+                    paths_buf.extend_from_slice(&path_buf);
+                    ctx_paths.push((subvol_of(&ns.ctx_subvol, ctx), ctx, start, path_buf.len()));
+                }
+            }
+        }
+        for &(subvol, ctx, start, len) in &ctx_paths {
+            let path = &paths_buf[start..start + len];
             let Some(vis) = ns
                 .vis_cache
-                .get(ctx)
+                .get(&ctx)
             else {
                 continue;
             };
@@ -805,7 +965,7 @@ fn emit_paths(
                 continue;
             }
             if d.d_type == DT_SUBVOL
-                && (d.parent_subvol != *subvol
+                && (d.parent_subvol != subvol
                     || !ns
                         .subvols
                         .get(&d.child_subvol)
@@ -814,7 +974,7 @@ fn emit_paths(
                 continue;
             }
             line.clear();
-            line.extend_from_slice(path.as_bytes());
+            line.extend_from_slice(path);
             line.push(b'/');
             line.extend_from_slice(d.name);
             sink(&line)?;
@@ -836,9 +996,15 @@ fn cmd_paths(fd: i32, prefix: &str, filter: &Filter, dump_dirs: bool) -> io::Res
     let mut out = BufWriter::with_capacity(4 << 20, stdout.lock());
 
     if dump_dirs {
+        let mut path = Vec::new();
+        let mut stack = Vec::new();
         for (inode, ctxs) in &ns.resolved {
-            for (subvol, ctx, path) in ctxs {
-                writeln!(out, "{inode}\t{subvol}\t{ctx}\t{path}")?;
+            for &(ctx, node) in ctxs {
+                path_of(&ns.nodes, &ns.names, node, &mut path, &mut stack);
+                let subvol = subvol_of(&ns.ctx_subvol, ctx);
+                write!(out, "{inode}\t{subvol}\t{ctx}\t")?;
+                out.write_all(&path)?;
+                out.write_all(b"\n")?;
             }
         }
         return out.flush();
@@ -1240,4 +1406,63 @@ fn main() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(prefix: &[u8], comps: &[&[u8]]) -> Vec<u8> {
+        let mut names = Names::new();
+        let mut nodes = vec![DirNode {
+            parent: NODE_NONE,
+            name: names.intern(prefix),
+        }];
+        for c in comps {
+            let name = names.intern(c);
+            let parent = nodes.len() as u32 - 1;
+            nodes.push(DirNode { parent, name });
+        }
+        let mut out = Vec::new();
+        let mut stack = Vec::new();
+        path_of(&nodes, &names, nodes.len() as u32 - 1, &mut out, &mut stack);
+        out
+    }
+
+    #[test]
+    fn interner_stores_each_name_once_and_keeps_raw_bytes() {
+        let mut names = Names::new();
+        let a = names.intern(b"etc");
+        let b = names.intern(b"etc");
+        let raw = names.intern(b"\xff\xfe/");
+        assert_eq!(a, b);
+        assert_ne!(a, raw);
+        assert_eq!(names.intern(b"\xff\xfe/"), raw);
+        assert_eq!(names.get(a), b"etc");
+        assert_eq!(names.get(raw), b"\xff\xfe/");
+        assert_eq!(
+            names
+                .spans
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn path_of_renders_root_verbatim_and_components_lossily() {
+        assert_eq!(path(b"/mnt", &[&b"x"[..]]).as_slice(), b"/mnt/x".as_slice());
+        assert_eq!(
+            path(b"/mnt/", &[&b"x"[..]]).as_slice(),
+            b"/mnt//x".as_slice()
+        );
+        assert_eq!(path(b"", &[&b"x"[..]]).as_slice(), b"/x".as_slice());
+        assert_eq!(
+            path(b"/mnt", &[&b"a"[..], &b"b"[..]]).as_slice(),
+            b"/mnt/a/b".as_slice()
+        );
+        assert_eq!(
+            path(b"/mnt", &[&b"\xff"[..]]).as_slice(),
+            "/mnt/\u{fffd}".as_bytes()
+        );
+    }
 }

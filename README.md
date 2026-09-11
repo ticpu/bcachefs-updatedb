@@ -72,6 +72,22 @@ LVM-on-LUKS NVMe plus one HDD, 521 subvolumes, 39 364 snapshots, 7.6 M dirent ke
 | `build`, live tree, dictionary from previous db | 13.3 M | 15.5 s | 0.73 GB | 281 MB db |
 | `build`, all snapshots | 56.2 M | 41.7 s | 1.77 GB | 723 MB db |
 
+**Backup server**: 20-core Neoverse-N1, 39 GB RAM, kernel 7.1.3 (Debian 13), DKMS 1.39.5,
+130 TB filesystem (34 TB used) on seven HDDs and four NVMe, 5253 subvolumes of which
+most are daily backup snapshots, 275 421 snapshot nodes, 138.5 M dirent keys (149.6 M
+with whiteouts). Run from the systemd unit (idle IO class, nice 19), so wall times
+include that.
+
+| run | paths | wall | peak RSS | output |
+|---|---|---|---|---|
+| `stats`, cold | 138.5 M keys | 239 s | 4 MB | 0.58 M keys/s, disk-bound |
+| `paths`, all snapshots | 589.3 M | 281 s | 12.1 GB | |
+| `build`, all snapshots, no dictionary | 589.3 M | 897 s | 17 GB | 7.49 GB db |
+
+The readdir-based `updatedb` on this machine indexes the same tree (its database holds
+18.44 M blocks to this one's 18.42 M, a day of churn apart) in 11 to 12 h, reading
+574 GB, and peaks at 2.3 GB plus 4.3 GB of swap under a 2 GB MemoryHigh.
+
 Scanning is independent of the snapshot count: keys shared between snapshots are stored
 once and read once. What grows with snapshots is the number of paths emitted and the
 resolved-directory map, which is where the memory goes.

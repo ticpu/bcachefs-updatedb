@@ -92,11 +92,11 @@ the full input, this tool takes it from the previous database like `updatedb`.
 
 ```
 bcachefs-updatedb build <mount> --output DB [--prefix P] [--conf FILE | --no-conf]
-                        [--prune PATH]... [--prune-name NAME]... [--group G]
-                        [--require-visibility BOOL] [--block-size N]
+                        [--prune PATH]... [--prune-name NAME]... [--skip-snapshots]
+                        [--group G] [--require-visibility BOOL] [--block-size N]
 bcachefs-updatedb build --from-list FILE --output DB [--group G] ...
 bcachefs-updatedb paths <mount> [--prefix P] [--conf FILE | --no-conf] [--prune PATH]...
-                        [--prune-name NAME]... [--dump-dirs]
+                        [--prune-name NAME]... [--skip-snapshots] [--dump-dirs]
 bcachefs-updatedb stats <mount>
 bcachefs-updatedb dump <mount>
 bcachefs-updatedb subvols <mount>
@@ -111,6 +111,8 @@ bcachefs-updatedb dbinfo <db> [--posting-lists]
   since one filesystem is indexed. `--conf` reads another file, `--no-conf` none;
   `--prune` and `--prune-name` add to whatever the file says. Unlike `updatedb`, the
   pruned entry itself is not emitted, and `--prune` also accepts a file path.
+- `--skip-snapshots` leaves out every subvolume carrying the snapshot flag, wherever it
+  sits and whatever its name. `subvols` shows the flag as `snap`.
 - `--group` names the group that owns the database. Without it, the group of the
   setgid `plocate` binary on PATH is used and printed; if there is none, the build
   fails rather than write a database only root can read.

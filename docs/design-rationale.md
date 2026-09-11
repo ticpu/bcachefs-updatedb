@@ -34,7 +34,7 @@ The database is readable only through the search binary's setgid group, and dist
 
 ## Pruning follows the system indexer's configuration
 
-Prune rules are read from the system indexer's configuration file, in its grammar, so one file governs both indexers and a second dialect never has to track it. Only the path and directory-name rules apply: filesystem-type and bind-mount rules select mounts, and this tool indexes exactly one. Command-line prunes extend the file's rules and never replace them. A pruned entry is dropped along with everything under it; the system indexer keeps the entry itself, and that difference is accepted rather than mirrored, so a pruned path never surfaces as a hit.
+Prune rules are read from the system indexer's configuration file, in its grammar, so one file governs both indexers and a second dialect never has to track it. Only the path and directory-name rules apply: filesystem-type and bind-mount rules select mounts, and this tool indexes exactly one. Command-line prunes extend the file's rules and never replace them. Snapshot subvolumes are left out by the subvolume's own snapshot flag, never by a name pattern: snapshots are routinely named as siblings of the tree they copy. A pruned entry is dropped along with everything under it; the system indexer keeps the entry itself, and that difference is accepted rather than mirrored, so a pruned path never surfaces as a hit.
 
 ## One filesystem per index
 

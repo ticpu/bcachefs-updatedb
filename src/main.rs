@@ -233,10 +233,21 @@ fn parse_dirent(k: &[u8]) -> Option<Dirent<'_>> {
 /// until cleanup runs, but readdir no longer shows it.
 const SUBVOLUME_STATE_LIVE: u32 = 0x4ad5_447e;
 
+const BCH_SUBVOLUME_RO: u32 = 1 << 0;
+const BCH_SUBVOLUME_SNAP: u32 = 1 << 1;
+
 struct Subvol {
     snapshot: u32,
     root_inode: u64,
     state: u32,
+    ro: bool,
+    snap: bool,
+}
+
+impl Subvol {
+    fn enterable(&self, skip_snapshots: bool) -> bool {
+        self.state == SUBVOLUME_STATE_LIVE && !(skip_snapshots && self.snap)
+    }
 }
 
 fn read_subvols(fd: i32) -> io::Result<HashMap<u32, Subvol>> {
@@ -244,6 +255,11 @@ fn read_subvols(fd: i32) -> io::Result<HashMap<u32, Subvol>> {
     for_each_key(fd, BTREE_SUBVOLUMES, 0, |k| {
         if key_type(k) == KEY_TYPE_SUBVOLUME {
             let val = &k[BKEY_HDR..];
+            let flags = u32::from_le_bytes(
+                val[0..4]
+                    .try_into()
+                    .unwrap(),
+            );
             out.insert(
                 key_offset(k) as u32,
                 Subvol {
@@ -262,6 +278,8 @@ fn read_subvols(fd: i32) -> io::Result<HashMap<u32, Subvol>> {
                             .try_into()
                             .unwrap(),
                     ),
+                    ro: flags & BCH_SUBVOLUME_RO != 0,
+                    snap: flags & BCH_SUBVOLUME_SNAP != 0,
                 },
             );
         }
@@ -388,13 +406,15 @@ where
 
 const DEFAULT_UPDATEDB_CONF: &str = "/etc/updatedb.conf";
 
-/// Exact paths to exclude, and directory names to exclude wherever they occur.
-struct Prunes {
+/// Exact paths to exclude, directory names to exclude wherever they occur, and
+/// whether snapshot subvolumes are left out of the walk.
+struct Filter {
     paths: Vec<String>,
     names: HashSet<Vec<u8>>,
+    skip_snapshots: bool,
 }
 
-impl Prunes {
+impl Filter {
     /// Match `dir/name` against the prune list without building the joined path,
     /// which would allocate once per emitted entry.
     fn is_pruned(&self, dir: &str, name: &[u8]) -> bool {
@@ -421,12 +441,13 @@ impl Prunes {
     }
 }
 
-fn load_prunes(
+fn load_filter(
     conf: Option<&str>,
     no_conf: bool,
     mut paths: Vec<String>,
     mut names: Vec<String>,
-) -> io::Result<Prunes> {
+    skip_snapshots: bool,
+) -> io::Result<Filter> {
     if !no_conf {
         let path = Path::new(conf.unwrap_or(DEFAULT_UPDATEDB_CONF));
         if let Some(c) = updatedb_conf::load(path, conf.is_some())? {
@@ -442,12 +463,13 @@ fn load_prunes(
             names.extend(c.prunenames);
         }
     }
-    Ok(Prunes {
+    Ok(Filter {
         paths,
         names: names
             .into_iter()
             .map(String::into_bytes)
             .collect(),
+        skip_snapshots,
     })
 }
 
@@ -502,6 +524,9 @@ enum Cmd {
         /// Read no configuration file.
         #[arg(long, conflicts_with = "conf")]
         no_conf: bool,
+        /// Do not enter subvolumes that are snapshots of another subvolume.
+        #[arg(long)]
+        skip_snapshots: bool,
         /// Print the resolved directory paths instead of the file list.
         #[arg(long)]
         dump_dirs: bool,
@@ -512,7 +537,7 @@ enum Cmd {
         /// Mount point of the bcachefs filesystem.
         mount: Option<String>,
         /// Index the newline-delimited paths of FILE instead of scanning a mount.
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["prefix", "prune", "prune_name", "conf", "no_conf"])]
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["prefix", "prune", "prune_name", "conf", "no_conf", "skip_snapshots"])]
         from_list: Option<String>,
         /// Database to write, replaced atomically.
         #[arg(long, value_name = "DB")]
@@ -532,6 +557,9 @@ enum Cmd {
         /// Read no configuration file.
         #[arg(long, conflicts_with = "conf")]
         no_conf: bool,
+        /// Do not enter subvolumes that are snapshots of another subvolume.
+        #[arg(long)]
+        skip_snapshots: bool,
         /// Group owning the database (default: the group of the setgid plocate on PATH).
         #[arg(long, value_name = "NAME")]
         group: Option<String>,
@@ -589,7 +617,7 @@ struct Namespace {
     vis_cache: HashMap<u32, HashMap<u32, u32>>,
 }
 
-fn resolve_namespace(fd: i32, prefix: &str, prunes: &Prunes) -> io::Result<Namespace> {
+fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Namespace> {
     let subvols = read_subvols(fd)?;
     let snaps = read_snapshots(fd)?;
     eprintln!("{} subvolumes, {} snapshots", subvols.len(), snaps.len());
@@ -693,13 +721,13 @@ fn resolve_namespace(fd: i32, prefix: &str, prunes: &Prunes) -> io::Result<Names
             {
                 continue; // whiteout won
             }
-            if prunes.is_pruned_name(&c.name) {
+            if filter.is_pruned_name(&c.name) {
                 continue;
             }
             let mut child_path = path.clone();
             child_path.push('/');
             child_path.push_str(&String::from_utf8_lossy(&c.name));
-            if prunes.has_path(&child_path) {
+            if filter.has_path(&child_path) {
                 continue;
             }
             let (nsubvol, nctx, ninode) = if c.is_subvol {
@@ -709,7 +737,7 @@ fn resolve_namespace(fd: i32, prefix: &str, prunes: &Prunes) -> io::Result<Names
                     continue;
                 }
                 match subvols.get(&c.child_subvol) {
-                    Some(sv) if sv.state == SUBVOLUME_STATE_LIVE => {
+                    Some(sv) if sv.enterable(filter.skip_snapshots) => {
                         (c.child_subvol, sv.snapshot, sv.root_inode)
                     }
                     _ => continue,
@@ -741,7 +769,7 @@ fn emit_paths(
     fd: i32,
     ns: &Namespace,
     prefix: &str,
-    prunes: &Prunes,
+    filter: &Filter,
     sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<u64> {
     let emit = Instant::now();
@@ -770,10 +798,10 @@ fn emit_paths(
                 continue;
             }
             let d = parse_dirent(&r.bytes).ok_or_else(|| unparsable(&r.bytes))?;
-            if prunes.is_pruned(path, d.name) {
+            if filter.is_pruned(path, d.name) {
                 continue;
             }
-            if (d.d_type == DT_DIR || d.d_type == DT_SUBVOL) && prunes.is_pruned_name(d.name) {
+            if (d.d_type == DT_DIR || d.d_type == DT_SUBVOL) && filter.is_pruned_name(d.name) {
                 continue;
             }
             if d.d_type == DT_SUBVOL
@@ -781,7 +809,7 @@ fn emit_paths(
                     || !ns
                         .subvols
                         .get(&d.child_subvol)
-                        .is_some_and(|sv| sv.state == SUBVOLUME_STATE_LIVE))
+                        .is_some_and(|sv| sv.enterable(filter.skip_snapshots)))
             {
                 continue;
             }
@@ -802,8 +830,8 @@ fn emit_paths(
     Ok(emitted)
 }
 
-fn cmd_paths(fd: i32, prefix: &str, prunes: &Prunes, dump_dirs: bool) -> io::Result<()> {
-    let ns = resolve_namespace(fd, prefix, prunes)?;
+fn cmd_paths(fd: i32, prefix: &str, filter: &Filter, dump_dirs: bool) -> io::Result<()> {
+    let ns = resolve_namespace(fd, prefix, filter)?;
     let stdout = io::stdout();
     let mut out = BufWriter::with_capacity(4 << 20, stdout.lock());
 
@@ -816,7 +844,7 @@ fn cmd_paths(fd: i32, prefix: &str, prunes: &Prunes, dump_dirs: bool) -> io::Res
         return out.flush();
     }
 
-    emit_paths(fd, &ns, prefix, prunes, &mut |line| {
+    emit_paths(fd, &ns, prefix, filter, &mut |line| {
         out.write_all(line)?;
         out.write_all(b"\n")
     })?;
@@ -849,7 +877,7 @@ enum Source<'a> {
     Scan {
         fd: i32,
         prefix: &'a str,
-        prunes: &'a Prunes,
+        filter: &'a Filter,
     },
     List(&'a Path),
 }
@@ -887,9 +915,9 @@ fn cmd_build(
         check_visibility,
     )?;
     match source {
-        Source::Scan { fd, prefix, prunes } => {
-            let ns = resolve_namespace(fd, prefix, prunes)?;
-            emit_paths(fd, &ns, prefix, prunes, &mut |line| db.add_file(line))?
+        Source::Scan { fd, prefix, filter } => {
+            let ns = resolve_namespace(fd, prefix, filter)?;
+            emit_paths(fd, &ns, prefix, filter, &mut |line| db.add_file(line))?
         }
         Source::List(list) => feed_list(list, &mut |line| db.add_file(line))?,
     };
@@ -1045,7 +1073,7 @@ fn main() -> io::Result<()> {
             for id in ids {
                 let s = &subvols[&id];
                 println!(
-                    "subvol {id} snapshot {} root_inode {} state {:#010x}{}",
+                    "subvol {id} snapshot {} root_inode {} state {:#010x}{}{}{}",
                     s.snapshot,
                     s.root_inode,
                     s.state,
@@ -1053,7 +1081,9 @@ fn main() -> io::Result<()> {
                         " live"
                     } else {
                         " NOT-LIVE"
-                    }
+                    },
+                    if s.ro { " ro" } else { "" },
+                    if s.snap { " snap" } else { "" }
                 );
             }
             eprintln!("{} subvolumes", subvols.len());
@@ -1151,12 +1181,13 @@ fn main() -> io::Result<()> {
             prune_name,
             conf,
             no_conf,
+            skip_snapshots,
             dump_dirs,
         } => {
-            let prunes = load_prunes(conf.as_deref(), no_conf, prune, prune_name)?;
+            let filter = load_filter(conf.as_deref(), no_conf, prune, prune_name, skip_snapshots)?;
             let fs = open_mount(&mount)?;
             let prefix = prefix.unwrap_or(mount);
-            cmd_paths(fs.as_raw_fd(), &prefix, &prunes, dump_dirs)?;
+            cmd_paths(fs.as_raw_fd(), &prefix, &filter, dump_dirs)?;
         }
         Cmd::Build {
             mount,
@@ -1167,19 +1198,21 @@ fn main() -> io::Result<()> {
             prune_name,
             conf,
             no_conf,
+            skip_snapshots,
             group,
             require_visibility,
             block_size,
         } => match (mount, from_list) {
             (Some(mount), None) => {
-                let prunes = load_prunes(conf.as_deref(), no_conf, prune, prune_name)?;
+                let filter =
+                    load_filter(conf.as_deref(), no_conf, prune, prune_name, skip_snapshots)?;
                 let fs = open_mount(&mount)?;
                 let prefix = prefix.unwrap_or(mount);
                 cmd_build(
                     Source::Scan {
                         fd: fs.as_raw_fd(),
                         prefix: &prefix,
-                        prunes: &prunes,
+                        filter: &filter,
                     },
                     Path::new(&output),
                     group.as_deref(),

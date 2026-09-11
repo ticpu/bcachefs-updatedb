@@ -12,6 +12,10 @@ Keys come from the btree-query ioctl issued against the mount point. Nothing rea
 
 Bypassing readdir bypasses the kernel's snapshot filtering, so this tool reimplements it, and that logic carries the tool's correctness. An entry is visible in a subvolume when its snapshot is an ancestor of that subvolume's; the nearest ancestor supersedes the rest; a whiteout at a visible snapshot removes the entry; and a subvolume dirent belongs to the subvolume that created it, so snapshots of its parent do not show it. Resolved paths are keyed by subvolume context and never by inode alone: snapshot subvolumes reuse inode numbers, and an inode-keyed map drops whole subtrees without any sign that it did.
 
+## Directory map holds structure, not paths
+
+Resolved directories form a tree of (parent node, interned name); a directory's path is materialized once per directory run at emission and never stored. Entries scale with directories times snapshot contexts, and a stored path multiplies that by its length. Two parents for one (context, inode) can only come from a rename landing between two ioctl batches; the second is dropped by a set that lives only while that context is being walked, never by a set over the whole run. Entry names are emitted raw and directory components rendered as lossy UTF-8, so the interner keeps raw bytes: name pruning compares the same bytes at resolve and at emission.
+
 ## Undecodable keys abort the run
 
 A key that cannot be decoded stops the run with an error instead of being skipped. The output's only claim is completeness; nothing downstream can tell an absent name from one never offered, and a layout change upstream presents exactly as names quietly going missing.

@@ -1027,6 +1027,9 @@ fn cmd_dbinfo(db: &Path, posting_lists: bool) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    // SAFETY: single-threaded here, so no other thread can observe the disposition change.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+
     let cli = Cli::parse();
 
     match cli.cmd {

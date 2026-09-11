@@ -376,6 +376,12 @@ fn encode_pfor_single_block(input: &[u32], interleaved: bool, out: &mut [u8], po
 fn append_block(input: &[u32], interleaved: bool, encoded: &mut Vec<u8>) {
     let mut buf = [0u8; SCRATCH_LEN];
     let end = encode_pfor_single_block(input, interleaved, &mut buf, 0);
+    if encoded.capacity() - encoded.len() < end {
+        encoded.reserve_exact(
+            end.max(encoded.len() / 8)
+                .max(64),
+        );
+    }
     encoded.extend_from_slice(&buf[..end]);
 }
 

@@ -103,7 +103,16 @@ where
         arg.used = 0;
         let ret = unsafe { libc::ioctl(fd, ioctl_nr(), &mut arg as *mut QueryBtreeKeys) };
         if ret < 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            let hint = if e.kind() == io::ErrorKind::PermissionDenied {
+                " (needs CAP_SYS_ADMIN)"
+            } else {
+                ""
+            };
+            return Err(io::Error::new(
+                e.kind(),
+                format!("BCH_IOCTL_QUERY_BTREE_KEYS btree {btree}: {e}{hint}"),
+            ));
         }
 
         let used = arg.used as usize;
@@ -161,10 +170,18 @@ fn key_inode(k: &[u8]) -> u64 {
 /// silently drops names from the index, so it has to stop the run.
 fn unparsable(k: &[u8]) -> io::Error {
     io::Error::other(format!(
-        "unparsable dirent: u64s={} type_byte={:#04x}",
+        "unparsable dirent: u64s={} type_byte={}",
         k[0],
-        k[BKEY_HDR + 8]
+        type_byte_str(&k[BKEY_HDR..])
     ))
+}
+
+/// The dirent type byte of a value, named as missing when the value is too short.
+fn type_byte_str(val: &[u8]) -> String {
+    match val.get(8) {
+        Some(t) => format!("{t:#04x}"),
+        None => "absent".to_string(),
+    }
 }
 
 struct Dirent<'a> {
@@ -580,10 +597,6 @@ fn load_filter(
     })
 }
 
-fn open_fs(path: &OsStr) -> io::Result<File> {
-    File::open(path)
-}
-
 /// The btree ioctl answers ENOTTY on every other filesystem, which names
 /// neither the path nor the reason.
 fn check_bcachefs(fd: i32, path: &Path) -> io::Result<()> {
@@ -712,9 +725,14 @@ fn parse_bool(s: &str) -> Result<bool, String> {
 }
 
 fn open_mount(mount: &OsStr) -> io::Result<File> {
-    let fs = open_fs(mount)?;
-    check_bcachefs(fs.as_raw_fd(), Path::new(mount))?;
+    let path = Path::new(mount);
+    let fs = File::open(path).map_err(|e| open_error(path, &e))?;
+    check_bcachefs(fs.as_raw_fd(), path)?;
     Ok(fs)
+}
+
+fn open_error(path: &Path, e: &io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
 }
 
 /// The live namespace: every directory inode with the paths it is reachable
@@ -1041,7 +1059,7 @@ fn cmd_paths(fd: i32, prefix: &[u8], filter: &Filter, dump_dirs: bool) -> io::Re
 /// list already carries the prefix line, so none is added.
 fn feed_list(list: &Path, sink: &mut dyn FnMut(&[u8]) -> io::Result<()>) -> io::Result<u64> {
     let read = Instant::now();
-    let file = File::open(list)?;
+    let file = File::open(list).map_err(|e| open_error(list, &e))?;
     let mut count = 0u64;
     for line in BufReader::with_capacity(4 << 20, file).split(b'\n') {
         sink(&line?)?;
@@ -1240,10 +1258,17 @@ fn cmd_dbinfo(db: &Path, posting_lists: bool) -> io::Result<()> {
     out.flush()
 }
 
-fn main() -> io::Result<()> {
+fn main() {
     // SAFETY: single-threaded here, so no other thread can observe the disposition change.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
 
+    if let Err(e) = run() {
+        eprintln!("bcachefs-updatedb: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> io::Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
@@ -1281,7 +1306,9 @@ fn main() -> io::Result<()> {
             let total = for_each_key(fd, BTREE_DIRENTS, FLAG_ALL_SNAPSHOTS, |k| {
                 if key_type(k) == KEY_TYPE_DIRENT {
                     dirents += 1;
-                    if k[BKEY_HDR + 8] & 0x80 != 0 {
+                    if k.get(BKEY_HDR + 8)
+                        .is_some_and(|t| t & 0x80 != 0)
+                    {
                         casefold += 1;
                     }
                     match parse_dirent(k) {
@@ -1295,10 +1322,10 @@ fn main() -> io::Result<()> {
                             if unparsed < 4 {
                                 let val = &k[BKEY_HDR..];
                                 eprintln!(
-                                    "unparsed: u64s={} val_len={} type_byte={:#04x} raw={:02x?}",
+                                    "unparsed: u64s={} val_len={} type_byte={} raw={:02x?}",
                                     k[0],
                                     val.len(),
-                                    val[8],
+                                    type_byte_str(val),
                                     &val[..val
                                         .len()
                                         .min(24)]

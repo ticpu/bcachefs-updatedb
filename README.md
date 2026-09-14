@@ -85,12 +85,13 @@ most are daily backup snapshots, 276 517 snapshot tree nodes, 138.6 M dirent key
 | `stats`, cold btree cache | 138.6 M keys | 195 s | 5 MB | 0.71 M keys/s, disk-bound |
 | `paths`, all snapshots | 586.7 M | 166 s | 1.69 GB | |
 | `build`, all snapshots, no dictionary | 586.7 M | 965 s | 3.46 GB | 7.90 GB db |
-| `build`, all snapshots, dictionary, from the systemd unit (idle IO, cold cache) | 586.7 M | 26.5 min | 1.9 GB | 6.87 GB db |
+| `build`, all snapshots, dictionary, from the systemd unit (idle IO) | 586.8 M | 20.7 min | 3.5 GB | 6.83 GB db |
 
 The readdir-based `updatedb` on this machine indexes the same tree (its database holds
 18.44 M blocks to this one's 18.34 M, a day of churn apart) in 11 to 12 h, reading
 574 GB, and peaks at 2.3 GB plus 4.3 GB of swap under a 2 GB MemoryHigh. The unit's
-cgroup reported 18.7 G peak for the last row, 17 G of it btree cache.
+cgroup reported 18.8 G peak for the last row, 16.7 G of it btree cache under
+slab_unreclaimable, and 30.6 G read from disk.
 
 Scanning is independent of the snapshot count: keys shared between snapshots are stored
 once and read once. What grows with snapshots is the number of paths emitted, the

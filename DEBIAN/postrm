@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+purge)
+	for l in /etc/systemd/system/timers.target.wants/bcachefs-updatedb@*.timer; do
+		[ -L "$l" ] || continue
+		t="${l##*/}"
+		systemctl disable "$t" "${t%.timer}.service"
+	done
+	;;
+esac
+
+case "$1" in
+remove|purge)
+	if [ -d /run/systemd/system ]; then
+		systemctl --system daemon-reload
+	fi
+	;;
+esac

@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+remove)
+	if [ -d /run/systemd/system ]; then
+		for l in /etc/systemd/system/timers.target.wants/bcachefs-updatedb@*.timer; do
+			[ -L "$l" ] || continue
+			t="${l##*/}"
+			systemctl stop "$t" "${t%.timer}.service"
+		done
+	fi
+	;;
+esac

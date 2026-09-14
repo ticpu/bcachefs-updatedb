@@ -35,6 +35,9 @@ define build-deb
 	install -D -m 644 -T README.md "$(PKG)/usr/share/doc/$(NAME)/README.md"
 	install -D -m 644 -T DEBIAN/control "$(PKG)/DEBIAN/control"
 	install -D -m 644 -T DEBIAN/conffiles "$(PKG)/DEBIAN/conffiles"
+	install -D -m 755 -T DEBIAN/postinst "$(PKG)/DEBIAN/postinst"
+	install -D -m 755 -T DEBIAN/prerm "$(PKG)/DEBIAN/prerm"
+	install -D -m 755 -T DEBIAN/postrm "$(PKG)/DEBIAN/postrm"
 	sed -i -e "s/^Version:.*/Version: $(DEB_VERSION)/" \
 		-e "s/^Architecture:.*/Architecture: $(1)/" \
 		-e "s/^Depends:.*/Depends: plocate, libc6 (>= $$(cat dist/glibc-floor.$(1))), libgcc-s1/" \
@@ -44,10 +47,10 @@ define build-deb
 	rm -rf "$(PKG)"
 endef
 
-$(DEB_AMD64): dist/$(BINARY).amd64 dist/glibc-floor.amd64 DEBIAN/control DEBIAN/conffiles
+$(DEB_AMD64): dist/$(BINARY).amd64 dist/glibc-floor.amd64 DEBIAN/control DEBIAN/conffiles DEBIAN/postinst DEBIAN/prerm DEBIAN/postrm
 	$(call build-deb,amd64)
 
-$(DEB_ARM64): dist/$(BINARY).arm64 dist/glibc-floor.arm64 DEBIAN/control DEBIAN/conffiles
+$(DEB_ARM64): dist/$(BINARY).arm64 dist/glibc-floor.arm64 DEBIAN/control DEBIAN/conffiles DEBIAN/postinst DEBIAN/prerm DEBIAN/postrm
 	$(call build-deb,arm64)
 
 # One container build cross-compiles both, so they share a single rule

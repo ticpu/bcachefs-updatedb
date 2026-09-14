@@ -38,13 +38,13 @@ same stream as text for `plocate-build -p` or for diffing against `find`.
 
 ## Performance
 
-Measured with this binary, `/usr/bin/time`, output to `/dev/null` for `paths`, no
-configuration file (`--no-conf`). Peak RSS is the process's own; a cgroup reports more
+Measured with `tests/bench.sh` (`/usr/bin/time`, output to `/dev/null` for `paths`, no
+configuration file). Peak RSS is the process's own; a cgroup reports more
 (see Limitations). "Live tree" prunes the snapshots directory; "all" indexes every
 snapshot; "snapshot tree nodes" counts every key in the snapshots btree, interior nodes
 included.
 
-**p4**: Ryzen 9 7950X3D, 61 GB RAM, kernel 7.1.9, bcachefs DKMS 1.39.2, 13.6 TB
+**Workstation A**: Ryzen 9 7950X3D, 61 GB RAM, kernel 7.1.9, bcachefs DKMS 1.39.2, 13.6 TB
 filesystem (8.8 TB used) on four HDDs and two NVMe, 209 subvolumes, 22 992 snapshot tree
 nodes, 17.1 M dirent keys (36.3 M keys with whiteouts).
 
@@ -62,7 +62,7 @@ filesystem took 1 h 47 min and 6.98 GB, and produced a 4.07 GB database. Path co
 not comparable: `updatedb` applied PRUNENAMES, these runs pruned one path. The claim is
 the wall time.
 
-**castgti86**: Ryzen 9 7950X3D, 32 GB RAM, kernel 7.2.4, DKMS 1.39.5, 735 GB filesystem
+**Workstation B**: Ryzen 9 7950X3D, 32 GB RAM, kernel 7.2.4, DKMS 1.39.5, 735 GB filesystem
 (430 GB used) on LVM-on-LUKS NVMe plus one HDD, 708 subvolumes, 43 028 snapshot tree
 nodes, 9.2 M dirent keys (14.0 M with whiteouts).
 
@@ -192,6 +192,12 @@ the cache stays (see Limitations).
   faults in to the unit's cgroup, and the btree cache shrinker is not memcg-aware, so
   that charge is never reclaimed under MemoryHigh or MemoryMax. Compare the process's
   VmHWM with the cgroup's slab_unreclaimable before reading "memory peak".
+
+## Development
+
+`ln -s ../../githooks/pre-commit .git/hooks/pre-commit` installs the pre-commit hook,
+which scans staged content with gitleaks. `tests/compare-db.sh` and `tests/bench.sh` need
+a bcachefs mount and root.
 
 ## License
 

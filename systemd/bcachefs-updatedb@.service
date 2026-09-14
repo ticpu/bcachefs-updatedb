@@ -8,7 +8,7 @@ ExecStart=/usr/bin/bcachefs-updatedb build %f --output /var/lib/plocate/bcachefs
 IOSchedulingClass=idle
 Nice=19
 
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_READ_SEARCH
 IPAddressDeny=any
 LockPersonality=true
 MemoryDenyWriteExecute=true

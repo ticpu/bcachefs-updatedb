@@ -52,7 +52,7 @@ fn get_u32(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(
         buf[off..off + 4]
             .try_into()
-            .unwrap(), // slice of four, checked by the caller's length test
+            .unwrap(),
     )
 }
 
@@ -60,7 +60,7 @@ fn get_u64(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(
         buf[off..off + 8]
             .try_into()
-            .unwrap(), // slice of eight, checked by the caller's length test
+            .unwrap(),
     )
 }
 
@@ -793,14 +793,12 @@ fn setgid_group_of_plocate() -> Option<(libc::gid_t, PathBuf)> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join("plocate");
-        let name = match CString::new(
+        let name = CString::new(
             candidate
                 .as_os_str()
                 .as_bytes(),
-        ) {
-            Ok(name) => name,
-            Err(_) => continue,
-        };
+        )
+        .expect("PATH entries cannot contain NUL");
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
         if unsafe { libc::stat(name.as_ptr(), st.as_mut_ptr()) } != 0 {
             continue;

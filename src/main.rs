@@ -345,9 +345,8 @@ fn read_snapshots(fd: i32) -> io::Result<HashMap<u32, SnapNode>> {
     Ok(out)
 }
 
-/// Snapshot ids visible from `snap`, mapped to their distance from it. A key is
-/// visible in a subvolume iff its snapshot is in this set; the smallest distance
-/// wins when several versions of one entry are.
+/// Snapshot ids visible from `snap`, mapped to their distance from it: a key is
+/// visible iff its snapshot is in the set, and the smallest distance wins.
 fn ancestry(snap: u32, snaps: &HashMap<u32, SnapNode>) -> HashMap<u32, u32> {
     let mut out = HashMap::new();
     let mut cur = snap;
@@ -688,7 +687,7 @@ enum Cmd {
         #[arg(long, value_name = "BOOL", default_value_t = true, action = clap::ArgAction::Set, value_parser = parse_bool)]
         require_visibility: bool,
         /// Number of filenames per compressed block.
-        #[arg(long, value_name = "N", default_value_t = 32)]
+        #[arg(long, value_name = "N", default_value_t = 32, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
         block_size: usize,
     },
     /// Print the header of a plocate database, and optionally its posting lists.

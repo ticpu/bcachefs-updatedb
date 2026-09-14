@@ -12,8 +12,8 @@ license=('GPL-2.0-only')
 depends=('plocate' 'gcc-libs' 'glibc' 'zstd')
 makedepends=('cargo')
 backup=('etc/profile.d/bcachefs-updatedb.sh')
-# The release profile strips, so a debug package would be empty and gdb-add-index
-# fails loudly over it.
+# Cargo strips debuginfo from release builds, so makepkg's debug split would be
+# empty and gdb-add-index fails over it.
 options=('!lto' '!debug')
 
 _repo="$startdir/.."

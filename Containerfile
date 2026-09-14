@@ -29,9 +29,8 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 
-# The .deb's glibc floor is read off each binary rather than guessed in the
-# control file: it moves with the base image, and too low a floor installs
-# cleanly and then dies at exec on a symbol version.
+# The .deb's glibc floor is read off each binary rather than guessed: it moves
+# with the base image, and too low a floor dies at exec on a symbol version.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     --mount=type=cache,target=/app/target,id=cargo-target \

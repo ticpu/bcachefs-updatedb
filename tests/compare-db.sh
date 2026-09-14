@@ -1,7 +1,6 @@
 #!/bin/bash
 # Compare the database written by `build` against plocate-build's, on one
-# bcachefs mount. Both databases index the same path list, so churn under the
-# mount cannot skew the comparison. Only the `paths` step needs root.
+# bcachefs mount and from one shared path list. Only `paths` needs root.
 set -euo pipefail
 
 if [ $# -lt 2 ]; then
@@ -54,7 +53,8 @@ echo "== posting lists"
 step "posting lists identical" diff -q "$workdir/a.pl" "$workdir/b.pl"
 
 compare_search() {
-	diff <(plocate -d "$a" "$@" | sort) <(plocate -d "$b" "$@" | sort)
+	diff <(env -u LOCATE_PATH plocate -d "$a" "$@" | sort) \
+		<(env -u LOCATE_PATH plocate -d "$b" "$@" | sort)
 }
 
 for needle in a ab bin .rs /usr/lib README; do

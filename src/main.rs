@@ -8,12 +8,14 @@ use bcachefs_updatedb::updatedb_conf;
 use clap::{Parser, Subcommand};
 use hashbrown::HashTable;
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::hash::{BuildHasher, RandomState};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use zstd::dict::EncoderDictionary;
 
@@ -410,15 +412,8 @@ struct DirNode {
     name: u32,
 }
 
-fn push_lossy(out: &mut Vec<u8>, name: &[u8]) {
-    match std::str::from_utf8(name) {
-        Ok(s) => out.extend_from_slice(s.as_bytes()),
-        Err(_) => out.extend_from_slice(String::from_utf8_lossy(name).as_bytes()),
-    }
-}
-
-/// Write the path of `node` into `out`, root component first and verbatim, every
-/// other component as lossy UTF-8. `stack` is scratch.
+/// Write the path of `node` into `out`, components joined by `/` and carrying the
+/// bytes the filesystem holds. `stack` is scratch.
 fn path_of(nodes: &[DirNode], names: &Names, node: u32, out: &mut Vec<u8>, stack: &mut Vec<u32>) {
     out.clear();
     stack.clear();
@@ -429,14 +424,11 @@ fn path_of(nodes: &[DirNode], names: &Names, node: u32, out: &mut Vec<u8>, stack
     }
     let mut first = true;
     while let Some(n) = stack.pop() {
-        let name = names.get(nodes[n as usize].name);
-        if first {
-            out.extend_from_slice(name);
-            first = false;
-        } else {
+        if !first {
             out.push(b'/');
-            push_lossy(out, name);
         }
+        first = false;
+        out.extend_from_slice(names.get(nodes[n as usize].name));
     }
 }
 
@@ -501,7 +493,7 @@ const DEFAULT_UPDATEDB_CONF: &str = "/etc/updatedb.conf";
 /// Exact paths to exclude, directory names to exclude wherever they occur, and
 /// whether snapshot subvolumes are left out of the walk.
 struct Filter {
-    paths: Vec<String>,
+    paths: Vec<Vec<u8>>,
     names: HashSet<Vec<u8>>,
     skip_snapshots: bool,
 }
@@ -512,8 +504,7 @@ impl Filter {
     fn is_pruned(&self, dir: &[u8], name: &[u8]) -> bool {
         self.paths
             .iter()
-            .any(|p| {
-                let b = p.as_bytes();
+            .any(|b| {
                 b.len() == dir.len() + 1 + name.len()
                     && b[..dir.len()] == *dir
                     && b[dir.len()] == b'/'
@@ -524,7 +515,7 @@ impl Filter {
     fn has_path(&self, path: &[u8]) -> bool {
         self.paths
             .iter()
-            .any(|p| p.as_bytes() == path)
+            .any(|p| p == path)
     }
 
     fn is_pruned_name(&self, name: &[u8]) -> bool {
@@ -533,15 +524,21 @@ impl Filter {
     }
 }
 
+fn byte_args(args: Vec<OsString>) -> Vec<Vec<u8>> {
+    args.into_iter()
+        .map(OsString::into_vec)
+        .collect()
+}
+
 fn load_filter(
-    conf: Option<&str>,
+    conf: Option<&Path>,
     no_conf: bool,
-    mut paths: Vec<String>,
-    mut names: Vec<String>,
+    mut paths: Vec<Vec<u8>>,
+    mut names: Vec<Vec<u8>>,
     skip_snapshots: bool,
 ) -> io::Result<Filter> {
     if !no_conf {
-        let path = Path::new(conf.unwrap_or(DEFAULT_UPDATEDB_CONF));
+        let path = conf.unwrap_or(Path::new(DEFAULT_UPDATEDB_CONF));
         if let Some(c) = updatedb_conf::load(path, conf.is_some())? {
             eprintln!(
                 "{}: {} prune paths, {} prune names",
@@ -551,27 +548,34 @@ fn load_filter(
                 c.prunenames
                     .len()
             );
-            paths.extend(c.prunepaths);
-            names.extend(c.prunenames);
+            paths.extend(
+                c.prunepaths
+                    .into_iter()
+                    .map(String::into_bytes),
+            );
+            names.extend(
+                c.prunenames
+                    .into_iter()
+                    .map(String::into_bytes),
+            );
         }
     }
     Ok(Filter {
         paths,
         names: names
             .into_iter()
-            .map(String::into_bytes)
             .collect(),
         skip_snapshots,
     })
 }
 
-fn open_fs(path: &str) -> io::Result<File> {
+fn open_fs(path: &OsStr) -> io::Result<File> {
     File::open(path)
 }
 
 /// The btree ioctl answers ENOTTY on every other filesystem, which names
 /// neither the path nor the reason.
-fn check_bcachefs(fd: i32, path: &str) -> io::Result<()> {
+fn check_bcachefs(fd: i32, path: &Path) -> io::Result<()> {
     let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(fd, st.as_mut_ptr()) } < 0 {
         return Err(io::Error::last_os_error());
@@ -582,7 +586,8 @@ fn check_bcachefs(fd: i32, path: &str) -> io::Result<()> {
     } as u64;
     if f_type != BCACHEFS_STATFS_MAGIC {
         return Err(io::Error::other(format!(
-            "{path} is not a bcachefs mount: statfs f_type {f_type:#x}"
+            "{} is not a bcachefs mount: statfs f_type {f_type:#x}",
+            path.display()
         )));
     }
     Ok(())
@@ -600,19 +605,19 @@ enum Cmd {
     /// Print every path reachable in the live namespace.
     Paths {
         /// Mount point of the bcachefs filesystem.
-        mount: String,
+        mount: OsString,
         /// Path the emitted names are rooted at (default: the mount point).
         #[arg(long, value_name = "PATH")]
-        prefix: Option<String>,
+        prefix: Option<OsString>,
         /// Exact path to exclude, on top of PRUNEPATHS, repeatable.
         #[arg(long, value_name = "PATH")]
-        prune: Vec<String>,
+        prune: Vec<OsString>,
         /// Directory name to exclude anywhere, on top of PRUNENAMES, repeatable.
         #[arg(long, value_name = "NAME")]
-        prune_name: Vec<String>,
+        prune_name: Vec<OsString>,
         /// Read PRUNEPATHS and PRUNENAMES from FILE (default: /etc/updatedb.conf).
         #[arg(long, value_name = "FILE")]
-        conf: Option<String>,
+        conf: Option<PathBuf>,
         /// Read no configuration file.
         #[arg(long, conflicts_with = "conf")]
         no_conf: bool,
@@ -627,25 +632,25 @@ enum Cmd {
     #[command(group = clap::ArgGroup::new("source").required(true).multiple(false).args(["mount", "from_list"]))]
     Build {
         /// Mount point of the bcachefs filesystem.
-        mount: Option<String>,
+        mount: Option<OsString>,
         /// Index the newline-delimited paths of FILE instead of scanning a mount.
         #[arg(long, value_name = "FILE", conflicts_with_all = ["prefix", "prune", "prune_name", "conf", "no_conf", "skip_snapshots"])]
-        from_list: Option<String>,
+        from_list: Option<OsString>,
         /// Database to write, replaced atomically.
         #[arg(long, value_name = "DB")]
-        output: String,
+        output: PathBuf,
         /// Path the indexed names are rooted at (default: the mount point).
         #[arg(long, value_name = "PATH")]
-        prefix: Option<String>,
+        prefix: Option<OsString>,
         /// Exact path to exclude, on top of PRUNEPATHS, repeatable.
         #[arg(long, value_name = "PATH")]
-        prune: Vec<String>,
+        prune: Vec<OsString>,
         /// Directory name to exclude anywhere, on top of PRUNENAMES, repeatable.
         #[arg(long, value_name = "NAME")]
-        prune_name: Vec<String>,
+        prune_name: Vec<OsString>,
         /// Read PRUNEPATHS and PRUNENAMES from FILE (default: /etc/updatedb.conf).
         #[arg(long, value_name = "FILE")]
-        conf: Option<String>,
+        conf: Option<PathBuf>,
         /// Read no configuration file.
         #[arg(long, conflicts_with = "conf")]
         no_conf: bool,
@@ -665,7 +670,7 @@ enum Cmd {
     /// Print the header of a plocate database, and optionally its posting lists.
     Dbinfo {
         /// Database to read.
-        db: String,
+        db: PathBuf,
         /// Print one line per non-empty hash table slot instead of the header.
         #[arg(long)]
         posting_lists: bool,
@@ -673,17 +678,17 @@ enum Cmd {
     /// Count dirent keys and name bytes by type.
     Stats {
         /// Mount point of the bcachefs filesystem.
-        mount: String,
+        mount: OsString,
     },
     /// Print every dirent key, all snapshots included.
     Dump {
         /// Mount point of the bcachefs filesystem.
-        mount: String,
+        mount: OsString,
     },
     /// List subvolumes with their snapshot, root inode and state.
     Subvols {
         /// Mount point of the bcachefs filesystem.
-        mount: String,
+        mount: OsString,
     },
 }
 
@@ -695,9 +700,9 @@ fn parse_bool(s: &str) -> Result<bool, String> {
     }
 }
 
-fn open_mount(mount: &str) -> io::Result<File> {
+fn open_mount(mount: &OsStr) -> io::Result<File> {
     let fs = open_fs(mount)?;
-    check_bcachefs(fs.as_raw_fd(), mount)?;
+    check_bcachefs(fs.as_raw_fd(), Path::new(mount))?;
     Ok(fs)
 }
 
@@ -724,7 +729,7 @@ struct CtxWalk {
     seen: HashSet<u64>,
 }
 
-fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Namespace> {
+fn resolve_namespace(fd: i32, prefix: &[u8], filter: &Filter) -> io::Result<Namespace> {
     let subvols = read_subvols(fd)?;
     let snaps = read_snapshots(fd)?;
     eprintln!(
@@ -795,7 +800,7 @@ fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Names
     let mut vis_cache: HashMap<u32, HashMap<u32, u32>> = HashMap::new();
     let mut nodes = vec![DirNode {
         parent: NODE_NONE,
-        name: names.intern(prefix.as_bytes()),
+        name: names.intern(prefix),
     }];
     let mut queue = vec![(root.snapshot, root.root_inode, 0u32)];
     let mut dups = 0u64;
@@ -835,7 +840,7 @@ fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Names
                 }
                 path.truncate(parent_len);
                 path.push(b'/');
-                push_lossy(&mut path, name);
+                path.extend_from_slice(name);
                 if filter.has_path(&path) {
                     continue;
                 }
@@ -909,12 +914,12 @@ fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Names
 fn emit_paths(
     fd: i32,
     ns: &Namespace,
-    prefix: &str,
+    prefix: &[u8],
     filter: &Filter,
     sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<u64> {
     let emit = Instant::now();
-    sink(prefix.as_bytes())?;
+    sink(prefix)?;
 
     let mut line: Vec<u8> = Vec::with_capacity(4096);
     let mut paths_buf: Vec<u8> = Vec::new();
@@ -987,7 +992,7 @@ fn emit_paths(
     Ok(emitted)
 }
 
-fn cmd_paths(fd: i32, prefix: &str, filter: &Filter, dump_dirs: bool) -> io::Result<()> {
+fn cmd_paths(fd: i32, prefix: &[u8], filter: &Filter, dump_dirs: bool) -> io::Result<()> {
     let ns = resolve_namespace(fd, prefix, filter)?;
     let stdout = io::stdout();
     let mut out = BufWriter::with_capacity(4 << 20, stdout.lock());
@@ -1039,7 +1044,7 @@ fn feed_list(list: &Path, sink: &mut dyn FnMut(&[u8]) -> io::Result<()>) -> io::
 enum Source<'a> {
     Scan {
         fd: i32,
-        prefix: &'a str,
+        prefix: &'a [u8],
         filter: &'a Filter,
     },
     List(&'a Path),
@@ -1347,9 +1352,17 @@ fn main() -> io::Result<()> {
             skip_snapshots,
             dump_dirs,
         } => {
-            let filter = load_filter(conf.as_deref(), no_conf, prune, prune_name, skip_snapshots)?;
+            let filter = load_filter(
+                conf.as_deref(),
+                no_conf,
+                byte_args(prune),
+                byte_args(prune_name),
+                skip_snapshots,
+            )?;
             let fs = open_mount(&mount)?;
-            let prefix = prefix.unwrap_or(mount);
+            let prefix = prefix
+                .unwrap_or(mount)
+                .into_vec();
             cmd_paths(fs.as_raw_fd(), &prefix, &filter, dump_dirs)?;
         }
         Cmd::Build {
@@ -1367,17 +1380,24 @@ fn main() -> io::Result<()> {
             block_size,
         } => match (mount, from_list) {
             (Some(mount), None) => {
-                let filter =
-                    load_filter(conf.as_deref(), no_conf, prune, prune_name, skip_snapshots)?;
+                let filter = load_filter(
+                    conf.as_deref(),
+                    no_conf,
+                    byte_args(prune),
+                    byte_args(prune_name),
+                    skip_snapshots,
+                )?;
                 let fs = open_mount(&mount)?;
-                let prefix = prefix.unwrap_or(mount);
+                let prefix = prefix
+                    .unwrap_or(mount)
+                    .into_vec();
                 cmd_build(
                     Source::Scan {
                         fd: fs.as_raw_fd(),
                         prefix: &prefix,
                         filter: &filter,
                     },
-                    Path::new(&output),
+                    &output,
                     group.as_deref(),
                     require_visibility,
                     block_size,
@@ -1386,7 +1406,7 @@ fn main() -> io::Result<()> {
             (None, Some(list)) => {
                 cmd_build(
                     Source::List(Path::new(&list)),
-                    Path::new(&output),
+                    &output,
                     group.as_deref(),
                     require_visibility,
                     block_size,
@@ -1399,7 +1419,7 @@ fn main() -> io::Result<()> {
             }
         },
         Cmd::Dbinfo { db, posting_lists } => {
-            cmd_dbinfo(Path::new(&db), posting_lists)?;
+            cmd_dbinfo(&db, posting_lists)?;
         }
     }
     Ok(())
@@ -1446,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn path_of_renders_root_verbatim_and_components_lossily() {
+    fn path_of_joins_components_as_raw_bytes() {
         assert_eq!(path(b"/mnt", &[&b"x"[..]]).as_slice(), b"/mnt/x".as_slice());
         assert_eq!(
             path(b"/mnt/", &[&b"x"[..]]).as_slice(),
@@ -1458,8 +1478,8 @@ mod tests {
             b"/mnt/a/b".as_slice()
         );
         assert_eq!(
-            path(b"/mnt", &[&b"\xff"[..]]).as_slice(),
-            "/mnt/\u{fffd}".as_bytes()
+            path(b"/mnt", &[&b"\xff"[..], &b"c"[..]]).as_slice(),
+            b"/mnt/\xff/c".as_slice()
         );
     }
 }

@@ -808,6 +808,9 @@ fn resolve_namespace(fd: i32, prefix: &[u8], filter: &Filter) -> io::Result<Name
         .collect();
     let mut resolved: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
     let mut walk: HashMap<u32, CtxWalk> = HashMap::new();
+    // A context's dedupe set dies when its walk ends, so a subvolume reached
+    // again later in the parent would be entered a second time.
+    let mut entered: HashSet<u32> = HashSet::new();
     let mut vis_cache: HashMap<u32, HashMap<u32, u32>> = HashMap::new();
     let mut nodes = vec![DirNode {
         parent: NODE_NONE,
@@ -863,6 +866,10 @@ fn resolve_namespace(fd: i32, prefix: &[u8], filter: &Filter) -> io::Result<Name
                     }
                     match subvols.get(&c.child_subvol) {
                         Some(sv) if sv.enterable(filter.skip_snapshots) => {
+                            if !entered.insert(c.child_subvol) {
+                                dups += 1;
+                                continue;
+                            }
                             (sv.snapshot, sv.root_inode)
                         }
                         _ => continue,

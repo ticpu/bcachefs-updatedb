@@ -1,10 +1,10 @@
 [Unit]
-Description=Update the plocate database for the bcachefs filesystem at /%I
-RequiresMountsFor=/%I
+Description=Update the plocate database for the bcachefs filesystem at %f
+RequiresMountsFor=%f
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/bcachefs-updatedb build /%I --output /var/lib/plocate/bcachefs-%i.db
+ExecStart=/usr/bin/bcachefs-updatedb build %f --output /var/lib/plocate/bcachefs-%i.db
 IOSchedulingClass=idle
 Nice=19
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=Update the plocate database for /%I daily
+Description=Update the plocate database for %f daily
 
 [Timer]
 OnCalendar=daily

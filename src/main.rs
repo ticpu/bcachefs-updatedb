@@ -340,8 +340,9 @@ fn ancestry(snap: u32, snaps: &HashMap<u32, SnapNode>) -> HashMap<u32, u32> {
     out
 }
 
-/// Name id of a whiteout, which carries no name.
-const NAME_WHITEOUT: u32 = u32::MAX;
+/// Name id of a version that hides whatever directory sits at its position: a
+/// whiteout, or a dirent pointing at something that is not a directory.
+const NAME_BLOCKED: u32 = u32::MAX;
 /// Parent of a root node.
 const NODE_NONE: u32 = u32::MAX;
 
@@ -739,48 +740,40 @@ fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Names
     let scan = Instant::now();
     let mut names = Names::new();
     let mut dir_children: HashMap<u64, Vec<DirChild>> = HashMap::new();
+    let mut versions: Vec<DirChild> = Vec::new();
     for_each_run(fd, BTREE_DIRENTS, |inode, run| {
-        let interesting = run
-            .iter()
-            .any(|r| {
-                r.ktype == KEY_TYPE_DIRENT
-                    && parse_dirent(&r.bytes)
-                        .is_some_and(|d| d.d_type == DT_DIR || d.d_type == DT_SUBVOL)
-            });
-        if !interesting {
-            return Ok(());
-        }
-        let slot = dir_children
-            .entry(inode)
-            .or_default();
+        versions.clear();
+        let mut any_dir = false;
         for r in run {
-            let hash = key_offset(&r.bytes);
-            match r.ktype {
-                KEY_TYPE_DIRENT => {
-                    let d = parse_dirent(&r.bytes).ok_or_else(|| unparsable(&r.bytes))?;
-                    if d.d_type == DT_DIR || d.d_type == DT_SUBVOL {
-                        slot.push(DirChild {
-                            hash,
-                            snapshot: r.snapshot,
-                            name: names.intern(d.name),
-                            target: d.target,
-                            child_subvol: d.child_subvol,
-                            parent_subvol: d.parent_subvol,
-                            is_subvol: d.d_type == DT_SUBVOL,
-                        });
-                    }
+            // Every version of the position is kept: a nearer non-directory one
+            // hides the directory an older snapshot has here.
+            let mut c = DirChild {
+                hash: key_offset(&r.bytes),
+                snapshot: r.snapshot,
+                name: NAME_BLOCKED,
+                target: 0,
+                child_subvol: 0,
+                parent_subvol: 0,
+                is_subvol: false,
+            };
+            if r.ktype == KEY_TYPE_DIRENT {
+                let d = parse_dirent(&r.bytes).ok_or_else(|| unparsable(&r.bytes))?;
+                if d.d_type == DT_DIR || d.d_type == DT_SUBVOL {
+                    any_dir = true;
+                    c.name = names.intern(d.name);
+                    c.target = d.target;
+                    c.child_subvol = d.child_subvol;
+                    c.parent_subvol = d.parent_subvol;
+                    c.is_subvol = d.d_type == DT_SUBVOL;
                 }
-                // A whiteout hides the entry in this snapshot and below.
-                _ => slot.push(DirChild {
-                    hash,
-                    snapshot: r.snapshot,
-                    name: NAME_WHITEOUT,
-                    target: 0,
-                    child_subvol: 0,
-                    parent_subvol: 0,
-                    is_subvol: false,
-                }),
             }
+            versions.push(c);
+        }
+        if any_dir {
+            dir_children
+                .entry(inode)
+                .or_default()
+                .append(&mut versions);
         }
         Ok(())
     })?;
@@ -833,7 +826,7 @@ fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Names
                 let Some(c) = choose_visible(run, vis, |c| c.snapshot) else {
                     continue;
                 };
-                if c.name == NAME_WHITEOUT {
+                if c.name == NAME_BLOCKED {
                     continue;
                 }
                 let name = names.get(c.name);

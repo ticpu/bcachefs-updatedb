@@ -14,7 +14,7 @@ Bypassing readdir bypasses the kernel's snapshot filtering, so this tool reimple
 
 ## Directory map holds structure, not paths
 
-Resolved directories form a tree of (parent node, interned name); a directory's path is materialized once per directory run at emission and never stored. Entries scale with directories times snapshot contexts, and a stored path multiplies that by its length. Two parents for one (context, inode) can only come from a rename landing between two ioctl batches; the second is dropped by a set that lives only while that context is being walked, never by a set over the whole run. Entry names are emitted raw and directory components rendered as lossy UTF-8, so the interner keeps raw bytes: name pruning compares the same bytes at resolve and at emission.
+Resolved directories form a tree of (parent node, interned name); a directory's path is materialized once per directory run at emission and never stored. Entries scale with directories times snapshot contexts, and a stored path multiplies that by its length. Two parents for one (context, inode) can only come from a rename landing between two ioctl batches; the second is dropped by a set that lives only while that context is being walked, never by a set over the whole run, and each subvolume is entered once per run. Names are bytes end to end: the interner, the prune rules and the emitted path carry the bytes the filesystem holds, and lossy UTF-8 appears only in diagnostics, because a path rendered any other way names nothing on disk.
 
 ## Undecodable keys abort the run
 

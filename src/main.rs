@@ -239,18 +239,19 @@ const SUBVOLUME_STATE_LIVE: u32 = 0x4ad5_447e;
 
 const BCH_SUBVOLUME_RO: u32 = 1 << 0;
 const BCH_SUBVOLUME_SNAP: u32 = 1 << 1;
+const BCH_SUBVOLUME_UNLINKED_OBSOLETE: u32 = 1 << 2;
 
 struct Subvol {
     snapshot: u32,
     root_inode: u64,
-    state: u32,
+    live: bool,
     ro: bool,
     snap: bool,
 }
 
 impl Subvol {
     fn enterable(&self, skip_snapshots: bool) -> bool {
-        self.state == SUBVOLUME_STATE_LIVE && !(skip_snapshots && self.snap)
+        self.live && !(skip_snapshots && self.snap)
     }
 }
 
@@ -264,6 +265,17 @@ fn read_subvols(fd: i32) -> io::Result<HashMap<u32, Subvol>> {
                     .try_into()
                     .unwrap(),
             );
+            // Values written before the state field are 40 bytes; the kernel maps
+            // state 0 through the flags the same way.
+            let state = val
+                .get(40..44)
+                .map(|b| {
+                    u32::from_le_bytes(
+                        b.try_into()
+                            .unwrap(),
+                    )
+                })
+                .unwrap_or(0);
             out.insert(
                 key_offset(k) as u32,
                 Subvol {
@@ -277,11 +289,10 @@ fn read_subvols(fd: i32) -> io::Result<HashMap<u32, Subvol>> {
                             .try_into()
                             .unwrap(),
                     ),
-                    state: u32::from_le_bytes(
-                        val[40..44]
-                            .try_into()
-                            .unwrap(),
-                    ),
+                    live: match state {
+                        0 => flags & BCH_SUBVOLUME_UNLINKED_OBSOLETE == 0,
+                        s => s == SUBVOLUME_STATE_LIVE,
+                    },
                     ro: flags & BCH_SUBVOLUME_RO != 0,
                     snap: flags & BCH_SUBVOLUME_SNAP != 0,
                 },
@@ -685,7 +696,7 @@ enum Cmd {
         /// Mount point of the bcachefs filesystem.
         mount: OsString,
     },
-    /// List subvolumes with their snapshot, root inode and state.
+    /// List subvolumes with their snapshot, root inode and liveness.
     Subvols {
         /// Mount point of the bcachefs filesystem.
         mount: OsString,
@@ -1241,15 +1252,10 @@ fn main() -> io::Result<()> {
             for id in ids {
                 let s = &subvols[&id];
                 println!(
-                    "subvol {id} snapshot {} root_inode {} state {:#010x}{}{}{}",
+                    "subvol {id} snapshot {} root_inode {} {}{}{}",
                     s.snapshot,
                     s.root_inode,
-                    s.state,
-                    if s.state == SUBVOLUME_STATE_LIVE {
-                        " live"
-                    } else {
-                        " NOT-LIVE"
-                    },
+                    if s.live { "live" } else { "not-live" },
                     if s.ro { " ro" } else { "" },
                     if s.snap { " snap" } else { "" }
                 );

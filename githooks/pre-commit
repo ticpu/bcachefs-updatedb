@@ -7,4 +7,4 @@ if ! command -v gitleaks >/dev/null 2>&1; then
     exit 1
 fi
 
-exec gitleaks git --staged --no-banner
+exec gitleaks git --staged --no-banner --log-level warn

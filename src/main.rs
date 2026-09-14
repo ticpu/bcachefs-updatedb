@@ -726,7 +726,11 @@ struct CtxWalk {
 fn resolve_namespace(fd: i32, prefix: &str, filter: &Filter) -> io::Result<Namespace> {
     let subvols = read_subvols(fd)?;
     let snaps = read_snapshots(fd)?;
-    eprintln!("{} subvolumes, {} snapshots", subvols.len(), snaps.len());
+    eprintln!(
+        "{} subvolumes, {} snapshot tree nodes",
+        subvols.len(),
+        snaps.len()
+    );
 
     let root = subvols
         .get(&1)
